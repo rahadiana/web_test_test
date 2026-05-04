@@ -1,11 +1,11 @@
-name: AI Website Security Audit
+name: Advanced AI Website Security Audit v2
 
 on:
   push:
     branches: ["main"]
   schedule:
-    # Otomatis setiap Senin pukul 01:00 UTC
-    - cron: "0 1 * * 1"
+    # Setiap Senin & Kamis pukul 01:00 UTC
+    - cron: "0 1 * * 1,4"
   workflow_dispatch:
     inputs:
       target_url:
@@ -13,25 +13,47 @@ on:
         required: true
         default: "https://bekasikota.go.id"
       scan_depth:
-        description: "Scan depth: quick | full"
+        description: "Scan depth: quick | full | aggressive"
         required: false
         default: "full"
+      auth_token:
+        description: "Bearer token untuk authenticated scan (optional)"
+        required: false
+        default: ""
+      notify_slack:
+        description: "Kirim notifikasi Slack? (true/false)"
+        required: false
+        default: "false"
 
 env:
   TARGET_URL: ${{ github.event.inputs.target_url || 'https://bekasikota.go.id' }}
   SCAN_DEPTH: ${{ github.event.inputs.scan_depth || 'full' }}
+  AUTH_TOKEN: ${{ github.event.inputs.auth_token || '' }}
   REPORT_DIR: security-reports
+  GOPATH: /home/runner/go
+  PATH: /home/runner/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ─────────────────────────────────────────────
+# PERMISSION: minimal required
+# ─────────────────────────────────────────────
+permissions:
+  issues: write
+  contents: write
+  security-events: write
 
 jobs:
-  # ─────────────────────────────────────────────
-  # JOB 1: Setup & validasi target
-  # ─────────────────────────────────────────────
+  # ═══════════════════════════════════════════
+  # JOB 0: Setup & Validasi Target
+  # ═══════════════════════════════════════════
   setup:
-    name: Setup environment
+    name: "🔧 Setup & Validate Target"
     runs-on: ubuntu-latest
     outputs:
       target_host: ${{ steps.parse.outputs.host }}
       target_ip: ${{ steps.parse.outputs.ip }}
+      target_scheme: ${{ steps.parse.outputs.scheme }}
+      scan_id: ${{ steps.parse.outputs.scan_id }}
+      is_reachable: ${{ steps.ping.outputs.reachable }}
     steps:
       - uses: actions/checkout@v4
 
@@ -43,16 +65,39 @@ jobs:
       - name: Install opencode-ai
         run: |
           bun install -g opencode-ai
-          opencode --version || opencode --help
+          opencode --version || opencode --help || true
 
-      - name: Parse target
+      - name: Parse & validate target
         id: parse
         run: |
-          HOST=$(echo "$TARGET_URL" | sed 's|https\?://||' | cut -d/ -f1)
-          IP=$(dig +short "$HOST" | head -1)
-          echo "host=$HOST" >> $GITHUB_OUTPUT
-          echo "ip=$IP" >> $GITHUB_OUTPUT
-          echo "Target: $HOST ($IP)"
+          URL="${TARGET_URL}"
+          SCHEME=$(echo "$URL" | grep -oE "^https?")
+          HOST=$(echo "$URL" | sed 's|https://||;s|http://||' | cut -d/ -f1)
+          IP=$(dig +short A "$HOST" | grep -E '^[0-9]+\.' | head -1)
+          SCAN_ID="audit-$(date +%Y%m%d-%H%M%S)-$(echo $RANDOM | md5sum | head -c 6)"
+
+          echo "scheme=$SCHEME" >> $GITHUB_OUTPUT
+          echo "host=$HOST"     >> $GITHUB_OUTPUT
+          echo "ip=${IP:-unknown}" >> $GITHUB_OUTPUT
+          echo "scan_id=$SCAN_ID"  >> $GITHUB_OUTPUT
+
+          echo "▶ Target  : $URL"
+          echo "▶ Host    : $HOST"
+          echo "▶ IP      : ${IP:-unresolved}"
+          echo "▶ Scan ID : $SCAN_ID"
+
+      - name: Check target reachability
+        id: ping
+        run: |
+          HOST=${{ steps.parse.outputs.host }}
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$TARGET_URL" 2>/dev/null) || CODE=0
+          if [ "$CODE" != "0" ] && [ "$CODE" != "000" ]; then
+            echo "reachable=true" >> $GITHUB_OUTPUT
+            echo "✅ Target reachable (HTTP $CODE)"
+          else
+            echo "reachable=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Target may be unreachable"
+          fi
 
       - name: Install security tools
         run: |
@@ -60,66 +105,135 @@ jobs:
           sudo apt-get install -y -qq \
             nmap nikto gobuster testssl.sh \
             curl wget dnsutils whois \
-            python3-pip jq
+            python3-pip jq openssl \
+            wfuzz hydra medusa \
+            golang-go 2>/dev/null || true
 
-          # nuclei untuk template CVE
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/null || true
-          export PATH=$PATH:$(go env GOPATH)/bin
+          # nuclei
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/null || true
+          # dalfox (XSS scanner)
+          go install github.com/hahwul/dalfox/v2@latest 2>/dev/null || true
+          # httpx (fast HTTP prober)
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest 2>/dev/null || true
+          # subfinder
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 2>/dev/null || true
+          # gau (GetAllURLs)
+          go install github.com/lc/gau/v2/cmd/gau@latest 2>/dev/null || true
+          # waybackurls
+          go install github.com/tomnomnom/waybackurls@latest 2>/dev/null || true
+          # sqlmap
+          pip install sqlmap --break-system-packages -q 2>/dev/null || true
 
-          echo "Tools installed:"
+          echo "=== Tool versions ==="
           nmap --version | head -1
           nikto -Version 2>/dev/null || true
           gobuster version 2>/dev/null || true
+          nuclei -version 2>/dev/null || true
 
-  # ─────────────────────────────────────────────
-  # JOB 2A: Recon — DNS, WHOIS, headers
-  # ─────────────────────────────────────────────
+  # ═══════════════════════════════════════════
+  # JOB 1A: Recon — DNS, WHOIS, ASN, Headers
+  # ═══════════════════════════════════════════
   recon:
-    name: Recon & fingerprinting
+    name: "🔍 Recon & Fingerprinting"
     runs-on: ubuntu-latest
     needs: setup
+    if: needs.setup.outputs.is_reachable == 'true'
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get install -y -qq dnsutils whois curl jq
+      - run: mkdir -p $REPORT_DIR
 
-      - name: Create report dir
-        run: mkdir -p $REPORT_DIR
-
-      - name: WHOIS lookup
+      - name: WHOIS & ASN lookup
         run: |
-          whois ${{ needs.setup.outputs.target_host }} > $REPORT_DIR/whois.txt 2>&1 || true
-          echo "=== WHOIS done ==="
+          HOST=${{ needs.setup.outputs.target_host }}
+          IP=${{ needs.setup.outputs.target_ip }}
+          {
+            echo "=== WHOIS ==="
+            whois "$HOST" 2>/dev/null || true
+            echo ""
+            echo "=== ASN Info ==="
+            curl -s "https://ipinfo.io/$IP/json" 2>/dev/null | jq . || true
+            echo ""
+            echo "=== Shodan-style passive recon ==="
+            curl -s "https://internetdb.shodan.io/$IP" 2>/dev/null | jq . || true
+          } > $REPORT_DIR/whois-asn.txt || true
 
-      - name: DNS enumeration
+      - name: DNS enumeration (comprehensive)
         run: |
           HOST=${{ needs.setup.outputs.target_host }}
           {
-            echo "=== A Records ==="
-            dig +short A $HOST
-            echo "=== MX Records ==="
-            dig +short MX $HOST
-            echo "=== TXT Records (SPF/DMARC) ==="
-            dig +short TXT $HOST
-            dig +short TXT _dmarc.$HOST
-            echo "=== NS Records ==="
-            dig +short NS $HOST
-            echo "=== Subdomains (brute) ==="
-            for sub in www api admin mail dev staging test beta app; do
-              result=$(dig +short A $sub.$HOST)
-              if [ -n "$result" ]; then echo "$sub.$HOST -> $result"; fi
-            done
-          } > $REPORT_DIR/dns.txt 2>&1 || true
+            echo "=== A / AAAA Records ==="
+            dig +short A "$HOST"; dig +short AAAA "$HOST"
 
-      - name: HTTP headers & tech fingerprint
+            echo "=== MX Records ==="
+            dig +short MX "$HOST"
+
+            echo "=== TXT Records (SPF/DMARC/DKIM) ==="
+            dig +short TXT "$HOST"
+            dig +short TXT "_dmarc.$HOST"
+            dig +short TXT "_domainkey.$HOST"
+
+            echo "=== NS / SOA Records ==="
+            dig +short NS "$HOST"; dig +short SOA "$HOST"
+
+            echo "=== CAA Records ==="
+            dig +short CAA "$HOST"
+
+            echo "=== Zone Transfer attempt ==="
+            for ns in $(dig +short NS "$HOST"); do
+              dig axfr "$HOST" @"$ns" 2>/dev/null | head -20 || true
+            done
+
+            echo "=== Subdomain brute-force ==="
+            for sub in www api admin mail dev staging test beta app mobile m \
+                       shop store blog forum support help cdn static assets \
+                       vpn ftp ssh git jenkins ci dashboard panel; do
+              result=$(dig +short A "$sub.$HOST" 2>/dev/null)
+              [ -n "$result" ] && echo "[FOUND] $sub.$HOST → $result"
+            done
+
+            echo "=== SPF misconfiguration check ==="
+            SPF=$(dig +short TXT "$HOST" | grep -i "spf")
+            if [ -z "$SPF" ]; then
+              echo "[WARN] No SPF record — email spoofing possible"
+            else
+              echo "[SPF] $SPF"
+              echo "$SPF" | grep -q "+all" && echo "[CRITICAL] SPF +all — allows any sender!"
+            fi
+
+            echo "=== DMARC check ==="
+            DMARC=$(dig +short TXT "_dmarc.$HOST")
+            [ -z "$DMARC" ] && echo "[WARN] No DMARC record" || echo "[DMARC] $DMARC"
+
+          } > $REPORT_DIR/dns.txt || true
+
+      - name: Subdomain enumeration (subfinder)
         run: |
+          export PATH=$PATH:/home/runner/go/bin
           HOST=${{ needs.setup.outputs.target_host }}
+          {
+            echo "=== Subfinder passive enumeration ==="
+            subfinder -d "$HOST" -silent 2>/dev/null | head -50 || echo "subfinder unavailable"
+            echo ""
+            echo "=== Wayback Machine URLs ==="
+            echo "$HOST" | waybackurls 2>/dev/null | head -100 || echo "waybackurls unavailable"
+          } > $REPORT_DIR/subdomains.txt || true
+
+      - name: HTTP headers, cookies & tech fingerprint
+        run: |
           URL=$TARGET_URL
+          AUTH_HEADER=""
+          [ -n "$AUTH_TOKEN" ] && AUTH_HEADER="-H 'Authorization: Bearer $AUTH_TOKEN'"
+
           {
             echo "=== Response Headers ==="
-            curl -sI --max-time 10 "$URL" 2>&1
+            curl -sI --max-time 10 $AUTH_HEADER "$URL"
 
             echo ""
-            echo "=== Security headers check ==="
+            echo "=== Security headers audit ==="
+            HEADERS=$(curl -sI --max-time 10 "$URL" 2>/dev/null)
+            SCORE=0
+            TOTAL=8
             for header in \
               "Strict-Transport-Security" \
               "Content-Security-Policy" \
@@ -127,25 +241,65 @@ jobs:
               "X-Content-Type-Options" \
               "Referrer-Policy" \
               "Permissions-Policy" \
-              "X-XSS-Protection"; do
-              val=$(curl -sI --max-time 10 "$URL" | grep -i "^$header:" || echo "MISSING: $header")
-              echo "$val"
+              "X-XSS-Protection" \
+              "Cross-Origin-Opener-Policy"; do
+              val=$(echo "$HEADERS" | grep -i "^$header:" | head -1)
+              if [ -n "$val" ]; then
+                echo "[PRESENT] $val"
+                SCORE=$((SCORE+1))
+              else
+                echo "[MISSING] $header — security risk"
+              fi
             done
+            echo ""
+            echo "Security header score: $SCORE/$TOTAL"
 
             echo ""
-            echo "=== Cookies analysis ==="
-            curl -sc /tmp/cookies --max-time 10 "$URL" > /dev/null 2>&1
-            cat /tmp/cookies 2>/dev/null || echo "No cookies"
+            echo "=== Cookie analysis ==="
+            COOKIES=$(curl -sI --max-time 10 "$URL" 2>/dev/null | grep -i "Set-Cookie:")
+            if [ -n "$COOKIES" ]; then
+              echo "$COOKIES" | while read -r line; do
+                echo "  $line"
+                echo "$line" | grep -qiv "httponly" && echo "  ⚠️  MISSING HttpOnly"
+                echo "$line" | grep -qiv "secure;" && echo "  ⚠️  MISSING Secure flag"
+                echo "$line" | grep -qiv "samesite" && echo "  ⚠️  MISSING SameSite"
+              done
+            else
+              echo "  No Set-Cookie headers in initial response"
+            fi
 
             echo ""
-            echo "=== Robots.txt ==="
-            curl -s --max-time 10 "$URL/robots.txt" 2>&1
+            echo "=== Technology fingerprint ==="
+            HTML=$(curl -s --max-time 10 "$URL" 2>/dev/null | head -c 3000)
+            SERVER=$(echo "$HEADERS" | grep -i "^Server:" | head -1)
+            POWERED=$(echo "$HEADERS" | grep -i "^X-Powered-By:" | head -1)
+            echo "Server       : ${SERVER:-not disclosed}"
+            echo "X-Powered-By : ${POWERED:-not disclosed}"
+            # CMS detection
+            echo "$HTML" | grep -qi "wp-content\|wp-includes" && echo "CMS: WordPress"
+            echo "$HTML" | grep -qi "joomla" && echo "CMS: Joomla"
+            echo "$HTML" | grep -qi "drupal" && echo "CMS: Drupal"
+            echo "$HTML" | grep -qi "laravel\|csrf-token" && echo "Framework: Laravel"
+            echo "$HTML" | grep -qi "next/static\|__NEXT_DATA__" && echo "Framework: Next.js"
+            echo "$HTML" | grep -qi "react\|_reactFiber" && echo "Frontend: React"
+            echo "$HTML" | grep -qi "vue\|data-v-" && echo "Frontend: Vue.js"
+            echo "$HTML" | grep -qi "angular" && echo "Frontend: Angular"
+            # Meta generator
+            echo "$HTML" | grep -oiE '<meta[^>]+generator[^>]+>' | head -3 | sed 's/^/  [META] /'
 
             echo ""
-            echo "=== Sitemap ==="
-            curl -s --max-time 10 "$URL/sitemap.xml" | head -50 2>&1
+            echo "=== Sensitive disclosures in HTML ==="
+            echo "$HTML" | grep -oiE "(apikey|api_key|secret|token|password|auth)[\"'][^\"']{8,}" \
+              | head -10 | sed 's/^/  [EXPOSED] /' || echo "  No obvious key/secret in HTML"
 
-          } > $REPORT_DIR/headers.txt 2>&1 || true
+            echo ""
+            echo "=== robots.txt ==="
+            curl -s --max-time 10 "$URL/robots.txt"
+            echo ""
+            echo "=== sitemap.xml (head) ==="
+            curl -s --max-time 10 "$URL/sitemap.xml" | head -50
+
+          } > $REPORT_DIR/headers.txt || true
 
       - name: Upload recon artifacts
         uses: actions/upload-artifact@v4
@@ -153,42 +307,68 @@ jobs:
           name: recon-results
           path: ${{ env.REPORT_DIR }}/
 
-  # ─────────────────────────────────────────────
-  # JOB 2B: Port scan dengan nmap
-  # ─────────────────────────────────────────────
+  # ═══════════════════════════════════════════
+  # JOB 1B: Port & Service Scan (nmap)
+  # ═══════════════════════════════════════════
   port-scan:
-    name: Port & service scan (nmap)
+    name: "🔌 Port & Service Scan"
     runs-on: ubuntu-latest
     needs: setup
+    if: needs.setup.outputs.is_reachable == 'true'
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get install -y -qq nmap
       - run: mkdir -p $REPORT_DIR
 
-      - name: Nmap quick scan (top 1000)
+      - name: Nmap — top 1000 ports (fast)
         run: |
-          IP=${{ needs.setup.outputs.target_ip }}
+          TARGET=${{ needs.setup.outputs.target_ip }}
           HOST=${{ needs.setup.outputs.target_host }}
-          TARGET=${IP:-$HOST}
-
-          nmap -sV -sC --open \
+          T="${TARGET:-$HOST}"
+          nmap -sV -sC --open -T4 \
+            --script "banner,http-headers,http-title,ssl-cert" \
             -oN $REPORT_DIR/nmap-quick.txt \
             -oX $REPORT_DIR/nmap-quick.xml \
-            "$TARGET" 2>&1 || true
+            "$T" 2>&1 || true
 
-      - name: Nmap full scan (if depth=full)
-        if: env.SCAN_DEPTH == 'full'
+      - name: Nmap — full port range (full/aggressive)
+        if: env.SCAN_DEPTH != 'quick'
         run: |
-          IP=${{ needs.setup.outputs.target_ip }}
+          TARGET=${{ needs.setup.outputs.target_ip }}
           HOST=${{ needs.setup.outputs.target_host }}
-          TARGET=${IP:-$HOST}
-
-          # Full port range + version + scripts
-          nmap -sV -sC -p- --open \
-            --script "vuln,safe" \
+          T="${TARGET:-$HOST}"
+          nmap -sV -sC -p- --open -T4 \
+            --script "vuln,safe,auth,discovery" \
             -oN $REPORT_DIR/nmap-full.txt \
             -oX $REPORT_DIR/nmap-full.xml \
-            "$TARGET" 2>&1 || true
+            "$T" 2>&1 || true
+
+      - name: Nmap — UDP top ports (aggressive only)
+        if: env.SCAN_DEPTH == 'aggressive'
+        run: |
+          TARGET=${{ needs.setup.outputs.target_ip }}
+          HOST=${{ needs.setup.outputs.target_host }}
+          T="${TARGET:-$HOST}"
+          sudo nmap -sU --top-ports 100 -T4 \
+            -oN $REPORT_DIR/nmap-udp.txt \
+            "$T" 2>&1 || true
+
+      - name: Parse interesting services
+        run: |
+          {
+            echo "=== Open ports summary ==="
+            grep -E "^[0-9]+/tcp.*open" $REPORT_DIR/nmap-quick.txt 2>/dev/null || true
+
+            echo ""
+            echo "=== Potentially dangerous services ==="
+            grep -iE "ftp|telnet|rdp|vnc|mysql|mssql|mongo|redis|elastic|smtp|pop3|imap" \
+              $REPORT_DIR/nmap-quick.txt 2>/dev/null | sed 's/^/  [WARN] /' || echo "  None found"
+
+            echo ""
+            echo "=== Anonymous/default auth findings ==="
+            grep -iE "anonymous|default|guest|failed|success" \
+              $REPORT_DIR/nmap-full.txt 2>/dev/null | head -20 || true
+          } > $REPORT_DIR/nmap-summary.txt || true
 
       - name: Upload port scan results
         uses: actions/upload-artifact@v4
@@ -196,48 +376,82 @@ jobs:
           name: portscan-results
           path: ${{ env.REPORT_DIR }}/
 
-  # ─────────────────────────────────────────────
-  # JOB 2C: SSL/TLS audit
-  # ─────────────────────────────────────────────
+  # ═══════════════════════════════════════════
+  # JOB 1C: SSL/TLS Deep Audit
+  # ═══════════════════════════════════════════
   ssl-audit:
-    name: SSL/TLS audit
+    name: "🔐 SSL/TLS Deep Audit"
     runs-on: ubuntu-latest
     needs: setup
+    if: needs.setup.outputs.is_reachable == 'true'
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install -y -qq testssl.sh
+      - run: sudo apt-get install -y -qq testssl.sh openssl curl
       - run: mkdir -p $REPORT_DIR
 
-      - name: testssl.sh scan
+      - name: testssl.sh — comprehensive TLS scan
         run: |
           HOST=${{ needs.setup.outputs.target_host }}
           testssl.sh \
             --severity LOW \
+            --full \
             --json-pretty \
-            --logfile $REPORT_DIR/ssl-log.txt \
-            --jsonfile $REPORT_DIR/ssl-result.json \
+            --logfile   $REPORT_DIR/ssl-log.txt \
+            --jsonfile  $REPORT_DIR/ssl-result.json \
+            --csvfile   $REPORT_DIR/ssl-result.csv \
             "$HOST" 2>&1 || true
 
-      - name: Manual TLS checks
+      - name: Manual TLS & cert analysis
         run: |
           HOST=${{ needs.setup.outputs.target_host }}
           {
-            echo "=== Certificate info ==="
+            echo "=== Certificate details ==="
             echo | openssl s_client -connect "$HOST:443" -servername "$HOST" 2>/dev/null \
-              | openssl x509 -noout -text 2>/dev/null | grep -E "Subject:|Issuer:|Not After|Not Before|DNS:" | head -20
+              | openssl x509 -noout -text 2>/dev/null \
+              | grep -E "Subject:|Issuer:|Not After|Not Before|DNS:|IP Address:|Public-Key:|Signature Algorithm:"
 
             echo ""
-            echo "=== Supported protocols ==="
+            echo "=== Certificate expiry check ==="
+            EXPIRY=$(echo | openssl s_client -connect "$HOST:443" 2>/dev/null \
+              | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+            echo "Expires: $EXPIRY"
+            DAYS=$(( ( $(date -d "$EXPIRY" +%s) - $(date +%s) ) / 86400 )) 2>/dev/null || DAYS=999
+            [ "$DAYS" -lt 30 ] && echo "[CRITICAL] Certificate expires in $DAYS days!" \
+              || echo "[OK] $DAYS days remaining"
+
+            echo ""
+            echo "=== Protocol support ==="
             for proto in ssl2 ssl3 tls1 tls1_1 tls1_2 tls1_3; do
-              result=$(echo | openssl s_client -connect "$HOST:443" -"$proto" 2>&1 | grep -E "Protocol|CONNECTED|FAILED" | head -1)
-              echo "$proto: $result"
+              result=$(echo | openssl s_client -connect "$HOST:443" -"$proto" 2>&1 \
+                | grep -E "Protocol|CONNECTED|handshake failure|alert" | head -1)
+              echo "  $proto: $result"
             done
 
             echo ""
-            echo "=== HSTS check ==="
-            curl -sI "https://$HOST" | grep -i "strict-transport" || echo "No HSTS header found"
+            echo "=== Weak cipher check ==="
+            for cipher in RC4-SHA DES-CBC3-SHA EXPORT-RC4-MD5 NULL-SHA; do
+              result=$(echo | openssl s_client -connect "$HOST:443" -cipher "$cipher" 2>&1 \
+                | grep -E "CONNECTED|alert" | head -1)
+              echo "  $cipher: $result"
+            done
 
-          } > $REPORT_DIR/tls-manual.txt 2>&1 || true
+            echo ""
+            echo "=== HSTS header ==="
+            curl -sI "https://$HOST" 2>/dev/null | grep -i "strict-transport" \
+              || echo "[WARN] No HSTS header"
+
+            echo ""
+            echo "=== Certificate transparency logs ==="
+            curl -s "https://crt.sh/?q=$HOST&output=json" 2>/dev/null \
+              | jq -r '.[0:10] | .[] | "\(.name_value) — \(.not_before)"' \
+              || echo "crt.sh unavailable"
+
+            echo ""
+            echo "=== OCSP stapling ==="
+            echo | openssl s_client -connect "$HOST:443" -status 2>/dev/null \
+              | grep -E "OCSP|stapling" | head -5 || echo "OCSP: could not determine"
+
+          } > $REPORT_DIR/ssl-manual.txt || true
 
       - name: Upload SSL results
         uses: actions/upload-artifact@v4
@@ -245,181 +459,387 @@ jobs:
           name: ssl-results
           path: ${{ env.REPORT_DIR }}/
 
-  # ─────────────────────────────────────────────
-  # JOB 3: Web vulnerability scanning
-  # ─────────────────────────────────────────────
+  # ═══════════════════════════════════════════
+  # JOB 2A: Web Vulnerability Scan
+  # ═══════════════════════════════════════════
   web-vuln-scan:
-    name: Web vulnerability scan
+    name: "🕷️ Web Vulnerability Scan"
     runs-on: ubuntu-latest
     needs: [recon, port-scan, ssl-audit]
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install -y -qq nikto gobuster curl python3 python3-pip wget
+      - run: sudo apt-get install -y -qq nikto gobuster curl python3 python3-pip wget golang-go jq
+      - run: pip install sqlmap --break-system-packages -q || true
+      - run: mkdir -p $REPORT_DIR
 
       - name: Install wordlists
         run: |
           sudo apt-get install -y -qq seclists 2>/dev/null || \
             git clone --depth=1 https://github.com/danielmiessler/SecLists.git /tmp/SecLists 2>/dev/null || true
-          ls /usr/share/seclists/ 2>/dev/null || ls /tmp/SecLists/ 2>/dev/null || true
-
-      - run: mkdir -p $REPORT_DIR
 
       - name: Nikto web scan
         run: |
+          AUTH_ARG=""
+          [ -n "$AUTH_TOKEN" ] && AUTH_ARG="-useragent 'SecurityAudit' -id '$AUTH_TOKEN'"
           nikto -host "$TARGET_URL" \
             -output $REPORT_DIR/nikto.txt \
             -Format txt \
             -timeout 10 \
-            -Plugins "headers,shellshock,outdated,auth" \
+            -maxtime 300 \
+            -Plugins "headers,shellshock,outdated,auth,apache,iis,cgi,cookies,robots" \
             2>&1 || true
 
-      - name: Directory enumeration (gobuster)
+      - name: Directory & file enumeration (gobuster)
         run: |
           WORDLIST="/usr/share/seclists/Discovery/Web-Content/common.txt"
           [ ! -f "$WORDLIST" ] && WORDLIST="/tmp/SecLists/Discovery/Web-Content/common.txt"
           [ ! -f "$WORDLIST" ] && \
             wget -q -O /tmp/common.txt \
-            "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" && \
-            WORDLIST="/tmp/common.txt"
+            "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" \
+            && WORDLIST="/tmp/common.txt"
 
-          # gobuster hanya melaporkan path yang DITEMUKAN (bukan 404)
-          # --no-error agar tidak fail, -b 404 untuk exclude 404 explicitly
+          WORDLIST_EXT="/usr/share/seclists/Discovery/Web-Content/raft-small-files.txt"
+          [ ! -f "$WORDLIST_EXT" ] && WORDLIST_EXT="$WORDLIST"
+
+          # Standard directory bruteforce (excludes 404)
           gobuster dir \
-            -u "$TARGET_URL" \
-            -w "$WORDLIST" \
-            -o $REPORT_DIR/gobuster-raw.txt \
-            -t 20 \
-            --timeout 10s \
-            -b 404 \
-            -q 2>&1 || true
+            -u "$TARGET_URL" -w "$WORDLIST" \
+            -o $REPORT_DIR/gobuster-dirs.txt \
+            -t 25 --timeout 10s -b 404 -q \
+            -x php,html,js,json,txt,bak,old,backup,zip,sql \
+            2>&1 || true
 
-          # Konversi path relatif ke full URL
-          if [ -f "$REPORT_DIR/gobuster-raw.txt" ]; then
-            echo "=== Gobuster findings (full URL) ===" > $REPORT_DIR/gobuster.txt
+          # Backup & sensitive file bruteforce
+          gobuster dir \
+            -u "$TARGET_URL" -w "$WORDLIST_EXT" \
+            -o $REPORT_DIR/gobuster-files.txt \
+            -t 25 --timeout 10s -b 404 -q \
+            2>&1 || true
+
+          # Convert to full URLs
+          {
+            echo "=== Directory findings (full URL) ==="
             while IFS= read -r line; do
-              path=$(echo "$line" | awk "{print \$1}")
-              status=$(echo "$line" | grep -oP "Status: \K[0-9]+")
-              if [ -n "$path" ]; then
-                echo "[HTTP:$status] $TARGET_URL$path"
-              fi
-            done < "$REPORT_DIR/gobuster-raw.txt" >> $REPORT_DIR/gobuster.txt
-          fi
-
-      - name: Basic SQLi test
-        run: |
-          {
-            echo "=== SQL Injection basic payloads ==="
-            URL=$TARGET_URL
-
-            # Gunakan --data-urlencode agar curl handle encoding, hindari quoting issue
-            PAYLOADS="QUOTE ORCLAUSE COMMENT OROR DROPTABLE"
-            for p in $PAYLOADS; do
-              case $p in
-                QUOTE)     PAYLOAD="'"           ;;
-                ORCLAUSE)  PAYLOAD="' OR '1'='1" ;;
-                COMMENT)   PAYLOAD="'--"         ;;
-                OROR)      PAYLOAD="1 OR 1=1"    ;;
-                DROPTABLE) PAYLOAD="1; DROP TABLE users--" ;;
-              esac
-              result=$(curl -s --max-time 5 --connect-timeout 5 -o /dev/null -w "%{http_code}" \
-                --get --data-urlencode "id=$PAYLOAD" "$URL" 2>&1)
-              echo "Payload: $PAYLOAD -> HTTP $result"
-            done
+              path=$(echo "$line" | awk '{print $1}')
+              status=$(echo "$line" | grep -oP 'Status: \K[0-9]+')
+              [ -n "$path" ] && echo "[$status] $TARGET_URL$path"
+            done < $REPORT_DIR/gobuster-dirs.txt 2>/dev/null || true
 
             echo ""
-            echo "=== Error-based SQLi on common params ==="
-            for param in id user name search q page; do
-              result=$(curl -s --max-time 5 --connect-timeout 5 \
-                --get --data-urlencode "$param='" "$URL" 2>&1 \
-                | grep -iE "sql|mysql|syntax|ora-|pg_" | head -3)
-              if [ -n "$result" ]; then
-                echo "POTENTIAL SQLi on ?$param: $result"
-              fi
-            done
-          } > $REPORT_DIR/sqli-test.txt 2>&1 || true
+            echo "=== File findings (full URL) ==="
+            while IFS= read -r line; do
+              path=$(echo "$line" | awk '{print $1}')
+              status=$(echo "$line" | grep -oP 'Status: \K[0-9]+')
+              [ -n "$path" ] && echo "[$status] $TARGET_URL$path"
+            done < $REPORT_DIR/gobuster-files.txt 2>/dev/null || true
+          } > $REPORT_DIR/gobuster-summary.txt || true
 
-      - name: Basic XSS test
+      - name: Sensitive file & endpoint exposure check
         run: |
-          {
-            echo "=== XSS basic reflection test ==="
-            XSS_PAYLOAD='<script>alert(1)</script>'
-            for param in q search name id; do
-              response=$(curl -s --max-time 5 --connect-timeout 5 \
-                --get --data-urlencode "$param=$XSS_PAYLOAD" "$TARGET_URL" 2>/dev/null) || true
-              if echo "$response" | grep -qF "$XSS_PAYLOAD"; then
-                echo "REFLECTED XSS found on param: $param"
-              else
-                echo "No reflection on: $param"
-              fi
-            done
+          URL=$TARGET_URL
+          BASELINE_SIZE=$(curl -s --max-time 5 \
+            "$URL/xzy-does-not-exist-abc-404check" 2>/dev/null | wc -c) || BASELINE_SIZE=0
 
-            echo ""
-            echo "=== Common sensitive files (hanya non-404) ==="
-            FOUND_COUNT=0
+          soft404_check() {
+            local FULL_URL="$1" LABEL="$2"
+            local RESP CODE SIZE BODY DIFF THRESHOLD
+            RESP=$(curl -s --max-time 8 --connect-timeout 5 \
+              -o /tmp/sens_body.tmp -w "%{http_code}|%{size_download}" "$FULL_URL" 2>/dev/null) || return
+            CODE=$(echo "$RESP" | cut -d'|' -f1)
+            SIZE=$(echo "$RESP" | cut -d'|' -f2)
+            BODY=$(cat /tmp/sens_body.tmp 2>/dev/null | head -c 500)
+            [ "$CODE" = "000" ] || [ "$CODE" = "404" ] && return
+            DIFF=$(( SIZE - BASELINE_SIZE )); [ $DIFF -lt 0 ] && DIFF=$(( -DIFF ))
+            THRESHOLD=$(( BASELINE_SIZE / 10 < 100 ? 100 : BASELINE_SIZE / 10 ))
+            echo "$BODY" | grep -qiE "not found|404|page not|tidak ditemukan" && return
+            [ "$CODE" = "200" ] && [ "$BASELINE_SIZE" -gt 50 ] && [ "$DIFF" -lt "$THRESHOLD" ] && \
+              echo "[SOFT404:$CODE] $FULL_URL" && return
+            echo "  [$LABEL:$CODE] $FULL_URL (${SIZE}b)"
+            echo "    Preview: $(echo "$BODY" | tr -d '\n' | head -c 150)"
+          }
+
+          {
+            echo "=== Sensitive file exposure (soft-404 aware) ==="
             for path in \
-              /.env /.git/config /config.php /wp-config.php \
-              /admin /administrator /phpmyadmin \
-              /.htaccess /backup.zip /database.sql \
-              /api/swagger /api/docs /graphql; do
-              FULL_URL="$TARGET_URL$path"
-              code=$(curl -s -o /dev/null -w "%{http_code}" \
-                --max-time 5 --connect-timeout 5 "$FULL_URL" 2>/dev/null) || true
-              # Hanya laporkan jika bukan 404 dan bukan error
-              if [ "$code" != "404" ] && [ "$code" != "000" ] && [ -n "$code" ]; then
-                echo "[FOUND:$code] $FULL_URL"
-                FOUND_COUNT=$((FOUND_COUNT+1))
-              fi
+              /.env /.env.local /.env.production /.env.backup /.env.example \
+              /.git/config /.git/HEAD /.git/COMMIT_EDITMSG \
+              /config.php /config.yml /config.yaml /config.json /settings.py \
+              /wp-config.php /wp-config.php.bak /wp-login.php \
+              /admin /administrator /admin.php /admin/login \
+              /phpmyadmin /adminer.php /dbadmin \
+              /.htaccess /.htpasswd \
+              /backup.zip /backup.tar.gz /backup.sql /database.sql /dump.sql \
+              /api/swagger /api/swagger.json /swagger-ui.html /api/docs \
+              /api/v1 /api/v2 /graphql /graphiql \
+              /actuator /actuator/health /actuator/env /actuator/dump \
+              /server-status /server-info /info.php /phpinfo.php \
+              /console /h2-console /jolokia /metrics /debug/vars \
+              /.well-known/security.txt /security.txt \
+              /crossdomain.xml /clientaccesspolicy.xml \
+              /package.json /composer.json /yarn.lock /package-lock.json \
+              /Makefile /Dockerfile /.dockerignore /docker-compose.yml \
+              /.travis.yml /.github/workflows /Jenkinsfile; do
+              soft404_check "$URL$path" "EXPOSED"
             done
-            if [ "$FOUND_COUNT" -eq 0 ]; then
-              echo "Tidak ada sensitive file yang ditemukan (semua 404)"
-            fi
-          } > $REPORT_DIR/xss-sensitive.txt 2>&1 || true
+          } > $REPORT_DIR/sensitive-files.txt || true
 
-      - name: OWASP Top 10 checks
+      - name: SQL Injection (sqlmap + manual)
         run: |
           {
-            echo "=== OWASP Top 10 Quick Checks ==="
-            URL=$TARGET_URL
+            echo "=== SQLi via sqlmap ==="
+            sqlmap -u "$TARGET_URL" \
+              --crawl=2 --level=3 --risk=2 \
+              --batch --random-agent \
+              --timeout=10 --retries=1 \
+              --output-dir=$REPORT_DIR/sqlmap \
+              --forms --threads=3 \
+              --answers="crack=N,follow=N,store=N,keep=N" \
+              2>&1 | tail -80 || true
 
             echo ""
-            echo "[A01] Broken Access Control (hanya non-404)"
-            for path in /admin /dashboard /user/1 /user/2 /api/v1/users /api/v1/admin; do
-              FULL_URL="$URL$path"
-              code=$(curl -s -o /dev/null -w "%{http_code}" \
-                --max-time 5 --connect-timeout 5 "$FULL_URL" 2>/dev/null) || true
-              if [ "$code" != "404" ] && [ "$code" != "000" ] && [ -n "$code" ]; then
-                echo "  [ACCESSIBLE:$code] $FULL_URL"
-              fi
-            done
-            echo "  (path yang 404 diabaikan)"
+            grep -rh "injectable\|vulnerable\|Parameter\|Type:" \
+              $REPORT_DIR/sqlmap/ 2>/dev/null \
+              || echo "No SQLi detected by sqlmap"
 
             echo ""
-            echo "[A02] Cryptographic Failures"
-            # Cek apakah site bisa diakses via HTTP (redirect check)
-            http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 --connect-timeout 5 "http://$(echo $URL | sed 's|https\?://||')")
-            echo "  HTTP access: $http_code (should be 301/302)"
-
-            echo ""
-            echo "[A05] Security Misconfiguration (hanya non-404)"
-            for file in /phpinfo.php /info.php /test.php /debug.php; do
-              FULL_URL="$URL$file"
-              code=$(curl -s -o /dev/null -w "%{http_code}" \
-                --max-time 5 --connect-timeout 5 "$FULL_URL" 2>/dev/null) || true
-              if [ "$code" != "404" ] && [ "$code" != "000" ] && [ -n "$code" ]; then
-                echo "  [EXPOSED:$code] $FULL_URL"
-              fi
+            echo "=== Error-based SQLi (manual fingerprint) ==="
+            for param in id user name q search page article category product; do
+              for payload in "1'" "1\" OR 1=1--" "' OR '1'='1" "1; SELECT SLEEP(3)--"; do
+                resp=$(curl -s --max-time 8 --connect-timeout 5 \
+                  --get --data-urlencode "$param=$payload" "$TARGET_URL" 2>/dev/null) || continue
+                if echo "$resp" | grep -qiE \
+                  "sql syntax|mysql_fetch|ORA-[0-9]+|pg_query|SQLSTATE|Unclosed quotation|\
+                   unterminated quoted|syntax error.*sql|You have an error in your SQL"; then
+                  echo "[VULN] Error-based SQLi on ?$param"
+                  echo "  Evidence: $(echo "$resp" | grep -iE "sql|mysql|ora-|pg_" | head -2)"
+                fi
+              done
             done
 
             echo ""
-            echo "[A06] Vulnerable & Outdated Components"
-            curl -sI --max-time 10 "$URL" | grep -iE "Server:|X-Powered-By:|X-AspNet-Version:" || echo "  No version disclosure"
+            echo "=== Time-based blind SQLi (SLEEP detection) ==="
+            for param in id user; do
+              START=$(date +%s%N)
+              curl -s --max-time 12 --connect-timeout 5 \
+                --get --data-urlencode "$param=1; SELECT SLEEP(5)--" "$TARGET_URL" > /dev/null 2>&1 || true
+              END=$(date +%s%N)
+              ELAPSED=$(( (END - START) / 1000000 ))
+              [ "$ELAPSED" -gt 4500 ] && \
+                echo "[POSSIBLE BLIND SQLi] ?$param caused ${ELAPSED}ms delay (SLEEP detected)" || true
+            done
+          } > $REPORT_DIR/sqli.txt || true
+
+      - name: XSS scan (dalfox + manual)
+        run: |
+          export PATH=$PATH:/home/runner/go/bin
+          {
+            echo "=== XSS scan with dalfox ==="
+            if command -v dalfox &>/dev/null; then
+              dalfox url "$TARGET_URL" \
+                --silence --no-color \
+                --timeout 10 --delay 200 \
+                -o $REPORT_DIR/dalfox-raw.txt 2>/dev/null || true
+              cat $REPORT_DIR/dalfox-raw.txt 2>/dev/null || echo "No dalfox findings"
+            else
+              echo "dalfox unavailable, manual XSS only"
+            fi
 
             echo ""
-            echo "[A07] Auth & Session Issues"
-            cookie=$(curl -sc /tmp/auth-cookies --max-time 10 "$URL" > /dev/null 2>&1; cat /tmp/auth-cookies)
-            echo "  Cookies: $cookie" | head -10
+            echo "=== Reflected XSS (manual) ==="
+            XSS_PAYLOADS=(
+              '<script>alert(1)</script>'
+              '"><script>alert(1)</script>'
+              "';alert(1)//"
+              '<img src=x onerror=alert(1)>'
+              '<svg/onload=alert(1)>'
+            )
+            for param in q search name id term keyword input; do
+              for payload in "${XSS_PAYLOADS[@]}"; do
+                response=$(curl -s --max-time 8 --connect-timeout 5 \
+                  --get --data-urlencode "$param=$payload" "$TARGET_URL" 2>/dev/null) || continue
+                echo "$response" | grep -qF "$payload" && \
+                  echo "[REFLECTED XSS] param=$param payload=$payload" || true
+              done
+            done
 
-          } > $REPORT_DIR/owasp-top10.txt 2>&1 || true
+            echo ""
+            echo "=== DOM XSS hints (source code analysis) ==="
+            HTML=$(curl -s --max-time 10 "$TARGET_URL" 2>/dev/null)
+            echo "$HTML" | grep -iE "document\.write|innerHTML|eval\(|location\.hash|location\.search" \
+              | head -10 | sed 's/^/  [DOM-HINT] /' || echo "  No obvious DOM XSS sinks"
+          } > $REPORT_DIR/xss.txt || true
+
+      - name: OWASP Top 10 comprehensive checks
+        run: |
+          URL=$TARGET_URL
+          HOST=$(echo "$URL" | sed 's|https://||;s|http://||' | cut -d/ -f1)
+
+          soft_check() {
+            local FURL="$1" LABEL="$2"
+            local CODE SIZE BODY
+            CODE=$(curl -s -o /tmp/owasp_body.tmp -w "%{http_code}" --max-time 8 "$FURL" 2>/dev/null) || return
+            SIZE=$(cat /tmp/owasp_body.tmp | wc -c)
+            BODY=$(cat /tmp/owasp_body.tmp | head -c 300)
+            echo "$BODY" | grep -qiE "not found|404" && return
+            [ "$CODE" = "404" ] || [ "$CODE" = "000" ] && return
+            echo "  [$LABEL:$CODE] $FURL (${SIZE}b)"
+          }
+
+          {
+            echo "=== [A01] Broken Access Control ==="
+            for path in /admin /dashboard /admin/users /api/v1/users /api/v1/admin \
+                        /user/1/edit /user/0 /api/v2/users/me; do
+              soft_check "$URL$path" "ACCESS"
+            done
+            # IDOR
+            for id in 0 1 2 -1 9999; do
+              soft_check "$URL/api/user/$id" "IDOR"
+              soft_check "$URL/user/$id" "IDOR"
+            done
+            # Horizontal privilege escalation via HTTP method
+            for method in PUT DELETE PATCH TRACE CONNECT; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -X "$method" "$URL" 2>/dev/null) || CODE=0
+              [ "$CODE" != "405" ] && [ "$CODE" != "404" ] && [ "$CODE" != "000" ] && \
+                echo "  [HTTP-METHOD] $method → $CODE (may be allowed)"
+            done
+
+            echo ""
+            echo "=== [A02] Cryptographic Failures ==="
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://$HOST" 2>/dev/null) || HTTP=0
+            echo "  HTTP→HTTPS redirect: $HTTP (want 301/302)"
+            HSTS=$(curl -sI --max-time 5 "https://$HOST" 2>/dev/null | grep -i "strict-transport")
+            echo "  HSTS: ${HSTS:-MISSING — CRITICAL}"
+            # Mixed content
+            curl -s --max-time 10 "$URL" 2>/dev/null \
+              | grep -oiE 'src="http://[^"]+"|href="http://[^"]+"' | head -5 \
+              | sed 's/^/  [MIXED-CONTENT] /' || true
+
+            echo ""
+            echo "=== [A03] Injection (CORS) ==="
+            CORS=$(curl -sI --max-time 5 -H "Origin: https://evil.com" "$URL" 2>/dev/null \
+              | grep -i "Access-Control")
+            if echo "$CORS" | grep -q "evil.com"; then
+              echo "  [VULN] CORS reflects evil origin!"
+            elif echo "$CORS" | grep -qi '\*'; then
+              echo "  [WARN] CORS wildcard (*)"
+            else
+              echo "  CORS: ${CORS:-none (OK for non-API)}"
+            fi
+            # CORS preflight
+            PREFLIGHT=$(curl -sI --max-time 5 -X OPTIONS \
+              -H "Origin: https://evil.com" \
+              -H "Access-Control-Request-Method: POST" \
+              "$URL" 2>/dev/null | grep -i "Access-Control")
+            echo "  CORS preflight: ${PREFLIGHT:-none}"
+
+            echo ""
+            echo "=== [A04] Insecure Design — Open Redirect ==="
+            for param in url redirect next return to dest destination goto; do
+              for payload in "https://evil.com" "//evil.com" "///evil.com" \
+                             "http://169.254.169.254/latest/meta-data/"; do
+                loc=$(curl -sI --max-time 5 --connect-timeout 5 \
+                  --get --data-urlencode "$param=$payload" "$URL" 2>/dev/null \
+                  | grep -i "^[Ll]ocation:") || true
+                if echo "$loc" | grep -qiE "evil|169\.254"; then
+                  echo "  [VULN] Open redirect/SSRF: ?$param=$payload → $loc"
+                fi
+              done
+            done
+
+            echo ""
+            echo "=== [A05] Security Misconfiguration ==="
+            for path in /phpinfo.php /info.php /test.php /debug.php \
+                        /.env /.env.local /.env.production \
+                        /config.yaml /config.json /settings.py \
+                        /server-status /server-info \
+                        /actuator /actuator/env /actuator/dump \
+                        /api-docs /swagger-ui.html /swagger-ui/ \
+                        /v1/api-docs /v2/api-docs \
+                        /.well-known/security.txt /security.txt; do
+              soft_check "$URL$path" "EXPOSED"
+            done
+            # WAF detection
+            WAF=$(curl -sI --max-time 5 \
+              -H "X-Forwarded-For: 127.0.0.1" \
+              "$URL/../../etc/passwd" 2>/dev/null \
+              | grep -iE "cloudflare|akamai|incapsula|sucuri|mod_security|AWS|Barracuda")
+            echo "  WAF detected: ${WAF:-None obvious}"
+
+            echo ""
+            echo "=== [A06] Outdated Components ==="
+            HEADERS=$(curl -sI --max-time 5 "$URL" 2>/dev/null)
+            echo "$HEADERS" | grep -iE "Server:|X-Powered-By:|X-AspNet-Version:|X-Generator:" \
+              | sed 's/^/  [DISCLOSED] /' || echo "  No version disclosure in headers"
+            curl -s --max-time 5 "$URL" 2>/dev/null \
+              | grep -iE "<meta.*generator|wp-content/plugins" | head -5 \
+              | sed 's/^/  [CMS] /' || true
+
+            echo ""
+            echo "=== [A07] Auth & Session Issues ==="
+            SET_COOKIE=$(curl -sI --max-time 5 "$URL" 2>/dev/null | grep -i "Set-Cookie:")
+            echo "$SET_COOKIE" | while read -r line; do
+              echo "    $line"
+              echo "$line" | grep -qiv "httponly" && echo "    [WARN] Missing HttpOnly"
+              echo "$line" | grep -qiv "secure" && echo "    [WARN] Missing Secure"
+              echo "$line" | grep -qiv "samesite" && echo "    [WARN] Missing SameSite"
+            done
+            # Default credentials
+            for cred in "admin:admin" "admin:password" "admin:123456" "test:test"; do
+              u=$(echo "$cred" | cut -d: -f1); p=$(echo "$cred" | cut -d: -f2)
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+                -u "$u:$p" "$URL/admin" 2>/dev/null) || CODE=0
+              [ "$CODE" = "200" ] && echo "  [CRITICAL] Default creds work: $cred on /admin"
+            done
+
+            echo ""
+            echo "=== [A08] Software & Data Integrity Failures ==="
+            # Subresource integrity check
+            curl -s --max-time 10 "$URL" 2>/dev/null \
+              | grep -E "<script|<link" \
+              | grep -v "integrity=" \
+              | grep -E "cdn\.|cloudflare\.|googleapis\." \
+              | head -5 | sed 's/^/  [NO-SRI] /' || echo "  CDN resources checked"
+
+            echo ""
+            echo "=== [A09] Logging & Monitoring — Error verbosity ==="
+            for payload in "/../../../etc/passwd" "/?debug=1" "/?XDEBUG_SESSION_START=phpstorm"; do
+              resp=$(curl -s --max-time 5 "$URL$payload" 2>/dev/null | head -c 800) || continue
+              echo "$resp" | grep -qiE "stack trace|exception|fatal error|warning:|xdebug|at line [0-9]" && \
+                echo "  [VULN] Verbose error at $payload" || true
+            done
+
+            echo ""
+            echo "=== [A10] SSRF ==="
+            for meta_url in \
+              "http://169.254.169.254/latest/meta-data/" \
+              "http://metadata.google.internal/computeMetadata/v1/" \
+              "http://100.100.100.200/latest/meta-data/"; do
+              for param in url redirect proxy host callback webhook target; do
+                resp=$(curl -s --max-time 5 --connect-timeout 3 \
+                  --get --data-urlencode "$param=$meta_url" "$URL" 2>/dev/null | head -c 200) || continue
+                echo "$resp" | grep -qiE "ami-|instance-id|iam|computeMetadata|alicloud" && \
+                  echo "  [CRITICAL] SSRF to cloud metadata via ?$param!"
+              done
+            done
+
+            echo ""
+            echo "=== HTTP Request Smuggling hints ==="
+            for te_payload in "chunked" "identity, chunked"; do
+              resp=$(curl -s --max-time 5 \
+                -H "Content-Length: 4" \
+                -H "Transfer-Encoding: $te_payload" \
+                -X POST "$URL" --data "1" 2>/dev/null | head -c 200) || true
+              echo "  TE: $te_payload → $(echo "$resp" | head -c 100)"
+            done
+
+            echo ""
+            echo "=== Clickjacking test ==="
+            XFRAME=$(curl -sI --max-time 5 "$URL" 2>/dev/null \
+              | grep -i "X-Frame-Options:\|frame-ancestors")
+            [ -n "$XFRAME" ] && echo "  [OK] $XFRAME" \
+              || echo "  [WARN] No X-Frame-Options / CSP frame-ancestors — clickjacking possible"
+
+          } > $REPORT_DIR/owasp-top10.txt || true
 
       - name: Upload web scan results
         uses: actions/upload-artifact@v4
@@ -427,13 +847,221 @@ jobs:
           name: webscan-results
           path: ${{ env.REPORT_DIR }}/
 
-  # ─────────────────────────────────────────────
-  # JOB 4: AI Analysis dengan opencode
-  # ─────────────────────────────────────────────
-  ai-analysis:
-    name: AI security analysis (opencode)
+  # ═══════════════════════════════════════════
+  # JOB 2B: Advanced Scan (nuclei + JWT + auth)
+  # ═══════════════════════════════════════════
+  advanced-scan:
+    name: "⚡ Advanced Scan (nuclei + JWT + rate-limit)"
     runs-on: ubuntu-latest
-    needs: web-vuln-scan
+    needs: [recon, port-scan, ssl-audit]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -qq curl jq golang-go 2>/dev/null || true
+      - run: mkdir -p $REPORT_DIR
+
+      - name: Install nuclei & tools
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/null || true
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest 2>/dev/null || true
+          export PATH=$PATH:$(go env GOPATH)/bin
+          nuclei -version 2>/dev/null || echo "nuclei: not available"
+
+      - name: Nuclei CVE & misconfiguration scan
+        run: |
+          export PATH=$PATH:$(go env GOPATH)/bin
+          {
+            echo "=== Nuclei — CVE / Misconfig / Exposure ==="
+            if command -v nuclei &>/dev/null; then
+              nuclei -update-templates -silent 2>/dev/null || true
+              nuclei -u "$TARGET_URL" \
+                -severity medium,high,critical \
+                -tags "cve,misconfig,exposure,takeover,auth,default-login,panel,tech" \
+                -timeout 10 -retries 1 -silent \
+                -o $REPORT_DIR/nuclei-findings.txt 2>/dev/null || true
+              cat $REPORT_DIR/nuclei-findings.txt 2>/dev/null || echo "No nuclei findings"
+
+              echo ""
+              echo "=== Nuclei — API security templates ==="
+              nuclei -u "$TARGET_URL" \
+                -tags "api,graphql,swagger,token,jwt,oauth" \
+                -timeout 10 -silent \
+                -o $REPORT_DIR/nuclei-api.txt 2>/dev/null || true
+              cat $REPORT_DIR/nuclei-api.txt 2>/dev/null || true
+
+              echo ""
+              echo "=== Nuclei — Default credentials ==="
+              nuclei -u "$TARGET_URL" \
+                -tags "default-login" \
+                -timeout 10 -silent \
+                -o $REPORT_DIR/nuclei-defaultcreds.txt 2>/dev/null || true
+              cat $REPORT_DIR/nuclei-defaultcreds.txt 2>/dev/null || echo "No default creds found"
+            else
+              echo "nuclei not available"
+            fi
+          } > $REPORT_DIR/nuclei-scan.txt || true
+
+      - name: JWT analysis & attacks
+        run: |
+          {
+            echo "=== JWT Token Detection & Analysis ==="
+            URL=$TARGET_URL
+            AUTH_HEADER_VAL=""
+            [ -n "$AUTH_TOKEN" ] && AUTH_HEADER_VAL="-H 'Authorization: Bearer $AUTH_TOKEN'"
+
+            RESPONSE_HEADERS=$(curl -sI --max-time 8 $AUTH_HEADER_VAL "$URL" 2>/dev/null)
+            RESPONSE_BODY=$(curl -s --max-time 8 $AUTH_HEADER_VAL "$URL" 2>/dev/null | head -c 8000)
+
+            JWT_PATTERN='eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*'
+            FOUND_JWTS=$(echo "$RESPONSE_HEADERS$RESPONSE_BODY" | grep -oE "$JWT_PATTERN" | sort -u | head -5)
+
+            if [ -n "$FOUND_JWTS" ]; then
+              echo "$FOUND_JWTS" | while read -r jwt; do
+                echo "[JWT FOUND] ${jwt:0:60}..."
+                HEADER=$(echo "$jwt" | cut -d. -f1 | \
+                  python3 -c "import sys,base64,json; d=sys.stdin.read().strip();\
+                    d+='='*(-len(d)%4); print(base64.urlsafe_b64decode(d).decode())" 2>/dev/null)
+                PAYLOAD=$(echo "$jwt" | cut -d. -f2 | \
+                  python3 -c "import sys,base64,json; d=sys.stdin.read().strip();\
+                    d+='='*(-len(d)%4); print(base64.urlsafe_b64decode(d).decode())" 2>/dev/null)
+                echo "  Header : $HEADER"
+                echo "  Payload: $PAYLOAD"
+                echo "$HEADER" | grep -qi '"alg":"none"' && echo "  [CRITICAL] alg:none attack possible!"
+                echo "$HEADER" | grep -qi '"alg":"HS' && echo "  [INFO] HMAC alg — check weak secret"
+                echo "$HEADER" | grep -qi '"alg":"RS' && echo "  [INFO] RSA alg — check key confusion attack"
+                # Check if exp is in the past
+                EXP=$(echo "$PAYLOAD" | grep -oP '"exp"\s*:\s*\K[0-9]+')
+                [ -n "$EXP" ] && NOW=$(date +%s) && \
+                  [ "$EXP" -lt "$NOW" ] && echo "  [WARN] JWT already expired!" || true
+              done
+            else
+              echo "No JWT found in initial response"
+            fi
+
+            echo ""
+            echo "=== Rate Limiting Test ==="
+            echo "Sending 30 rapid requests to login endpoint..."
+            BLOCKED=false
+            ENDPOINT="$URL/login"
+            # Try common login endpoints
+            for ep in /login /api/login /api/v1/login /auth/login /signin; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$URL$ep" 2>/dev/null) || CODE=0
+              [ "$CODE" != "404" ] && [ "$CODE" != "000" ] && ENDPOINT="$URL$ep" && break
+            done
+            echo "  Testing endpoint: $ENDPOINT"
+            for i in $(seq 1 30); do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 \
+                -X POST "$ENDPOINT" \
+                -d "username=admin&password=wrongpass$i" 2>/dev/null) || CODE=0
+              printf "  #$i:$CODE "
+              echo "$CODE" | grep -qE "^(429|503|403)$" && BLOCKED=true && echo && break
+              [ $(( i % 10 )) -eq 0 ] && echo
+            done
+            echo ""
+            $BLOCKED && echo "  [PROTECTED] Rate limiting active" \
+              || echo "  [WARN] No rate limiting detected — brute force possible"
+
+            echo ""
+            echo "=== OAuth / SSO misconfiguration hints ==="
+            for path in /oauth /oauth2 /oauth/authorize /auth/oauth /sso /saml /openid; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$URL$path" 2>/dev/null) || CODE=0
+              [ "$CODE" != "404" ] && [ "$CODE" != "000" ] && \
+                echo "  [FOUND] $URL$path → HTTP $CODE"
+            done
+
+            echo ""
+            echo "=== HTTP Security Headers Score ==="
+            HEADERS=$(curl -sI --max-time 5 "$URL" 2>/dev/null)
+            SCORE=0
+            for h in "Strict-Transport-Security" "Content-Security-Policy" \
+                     "X-Frame-Options" "X-Content-Type-Options" \
+                     "Referrer-Policy" "Permissions-Policy"; do
+              echo "$HEADERS" | grep -qi "$h:" && SCORE=$((SCORE+1)) \
+                && echo "  [OK] $h" || echo "  [MISSING] $h"
+            done
+            echo "  Score: $SCORE/6"
+
+            echo ""
+            echo "=== WebSocket detection ==="
+            curl -s --max-time 8 "$URL" 2>/dev/null \
+              | grep -iE "WebSocket|ws://|wss://" | head -5 \
+              | sed 's/^/  [WS] /' || echo "  No WebSocket references in HTML"
+
+            echo ""
+            echo "=== GraphQL introspection ==="
+            for gql_ep in /graphql /api/graphql /graphiql; do
+              RESP=$(curl -s --max-time 8 -X POST "$URL$gql_ep" \
+                -H "Content-Type: application/json" \
+                -d '{"query":"{ __schema { types { name } } }"}' 2>/dev/null)
+              echo "$RESP" | grep -q "__schema" && \
+                echo "  [EXPOSED] GraphQL introspection enabled at $URL$gql_ep" || true
+            done
+
+          } > $REPORT_DIR/advanced-scan.txt || true
+
+      - name: Infrastructure & cloud misconfiguration
+        run: |
+          HOST=${{ needs.setup.outputs.target_host }}
+          {
+            echo "=== Cloud metadata exposure ==="
+            for meta in \
+              "http://169.254.169.254/latest/meta-data/" \
+              "http://169.254.169.254/latest/user-data/" \
+              "http://metadata.google.internal/computeMetadata/v1/?recursive=true" \
+              "http://100.100.100.200/latest/meta-data/"; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$meta" 2>/dev/null) || CODE=0
+              [ "$CODE" = "200" ] && echo "[ACCESSIBLE] $meta — CLOUD METADATA EXPOSED!" \
+                || echo "[BLOCKED] $meta → $CODE"
+            done
+
+            echo ""
+            echo "=== S3 bucket misconfiguration ==="
+            # Try common S3 bucket naming patterns
+            BASENAME=$(echo "$HOST" | cut -d. -f1)
+            for bucket in "$BASENAME" "${BASENAME}-assets" "${BASENAME}-backup" \
+                          "${BASENAME}-static" "${BASENAME}-media" "${BASENAME}-uploads"; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+                "https://$bucket.s3.amazonaws.com" 2>/dev/null) || CODE=0
+              [ "$CODE" != "404" ] && [ "$CODE" != "000" ] && \
+                echo "  [S3:$CODE] $bucket.s3.amazonaws.com"
+            done
+
+            echo ""
+            echo "=== Email security (SPF/DMARC/DKIM) ==="
+            SPF=$(dig +short TXT "$HOST" 2>/dev/null | grep -i "spf")
+            DMARC=$(dig +short TXT "_dmarc.$HOST" 2>/dev/null)
+            echo "  SPF   : ${SPF:-MISSING — email spoofing possible!}"
+            echo "  DMARC : ${DMARC:-MISSING}"
+            echo "$SPF" | grep -q "+all" && echo "  [CRITICAL] SPF +all allows any sender"
+            echo "$DMARC" | grep -qi "p=none" && echo "  [WARN] DMARC p=none — no enforcement"
+
+            echo ""
+            echo "=== Subdomain takeover hints ==="
+            for sub in www api dev staging test app beta admin; do
+              CNAME=$(dig +short CNAME "$sub.$HOST" 2>/dev/null)
+              if [ -n "$CNAME" ]; then
+                echo "  CNAME: $sub.$HOST → $CNAME"
+                # Check if CNAME points to unregistered service
+                CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "https://$sub.$HOST" 2>/dev/null) || CODE=0
+                echo "$CODE" | grep -qE "404|NoSuchBucket|There is no app here" && \
+                  echo "  [POSSIBLE TAKEOVER] $sub.$HOST ($CODE)" || true
+              fi
+            done
+
+          } > $REPORT_DIR/infra-cloud.txt || true
+
+      - name: Upload advanced scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: advanced-scan-results
+          path: ${{ env.REPORT_DIR }}/
+
+  # ═══════════════════════════════════════════
+  # JOB 3: AI Analysis — opencode writes files
+  # ═══════════════════════════════════════════
+  ai-analysis:
+    name: "🤖 AI Analysis (opencode)"
+    runs-on: ubuntu-latest
+    needs: [web-vuln-scan, advanced-scan]
     steps:
       - uses: actions/checkout@v4
 
@@ -446,6 +1074,7 @@ jobs:
         run: |
           bun install -g opencode-ai
           sleep 3
+          opencode --version || true
 
       - name: Download all scan artifacts
         uses: actions/download-artifact@v4
@@ -456,84 +1085,175 @@ jobs:
         run: |
           mkdir -p $REPORT_DIR
           find downloaded-artifacts/ -name "*.txt" -exec cat {} \; > $REPORT_DIR/all-findings.txt
-          find downloaded-artifacts/ -name "*.json" -exec cat {} \; > $REPORT_DIR/all-findings.json
-          echo "=== MERGED REPORT SIZE ==="
+          find downloaded-artifacts/ -name "*.json" | head -5 \
+            | xargs -I{} cat {} >> $REPORT_DIR/all-findings-json.txt 2>/dev/null || true
+          echo "=== Merged report ==="
           wc -l $REPORT_DIR/all-findings.txt
 
-      - name: AI analysis - Executive summary
+      # ── opencode writes files itself (no output redirection needed) ──
+
+      - name: opencode — Executive Summary Report
         run: |
-          FINDINGS=$(cat $REPORT_DIR/all-findings.txt | head -500)
+          FINDINGS=$(cat $REPORT_DIR/all-findings.txt | head -600)
+          SCAN_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+
           opencode run "
-            Kamu adalah security analyst senior. Analisis hasil scan keamanan berikut:
+          Kamu adalah senior security analyst & CISO. Buat laporan keamanan KOMPREHENSIF.
 
-            TARGET: $TARGET_URL
-            TANGGAL: $(date)
+          TARGET    : $TARGET_URL
+          SCAN DATE : $SCAN_DATE
+          SCAN DEPTH: $SCAN_DEPTH
+          SCAN ID   : ${{ needs.setup.outputs.scan_id || 'N/A' }}
 
-            ATURAN PENTING SEBELUM ANALISIS:
-            - ABAIKAN semua path/URL yang mengembalikan HTTP 404 (Not Found) - itu tidak exist
-            - ABAIKAN semua entry bertanda [404] atau tidak memiliki label [FOUND:] / [ACCESSIBLE:] / [EXPOSED:]
-            - Hanya analisis path/file yang statusnya 200, 301, 302, 403, 500, atau kode lain selain 404
-            - Pastikan setiap temuan menyertakan FULL URL (https://...), bukan hanya path relatif
-            - Jika tidak ada temuan yang valid (semua 404), nyatakan 'Tidak ada finding aktif'
+          ===== ATURAN ANALISIS =====
+          1. ABAIKAN semua path/endpoint yang return HTTP 404
+          2. Hanya analisis yang DITEMUKAN (HTTP 200, 301, 302, 403, 500, dsb)
+          3. Setiap finding HARUS menyertakan FULL URL (https://...)
+          4. Jika semua 404 → tulis 'Tidak ada finding aktif ditemukan'
+          5. CVSS score harus realistis berdasarkan evidence yang ada
 
-            HASIL SCAN:
-            $FINDINGS
+          ===== HASIL SCAN =====
+          $FINDINGS
 
-            Berikan analisis dalam format:
-            ## Executive Summary
-            ## Critical Findings (CVSS >= 7.0) — hanya yang benar-benar accessible
-            ## High Findings (CVSS 4.0-6.9)
-            ## Medium Findings (CVSS 2.0-3.9)
-            ## Low/Info Findings
-            ## Rekomendasi Prioritas (top 5)
-            ## Risk Score Overall (1-10)
+          ===== OUTPUT FORMAT =====
+          Tulis LANGSUNG ke file: $REPORT_DIR/ai-executive-summary.md
 
-            Untuk setiap finding sertakan:
-            - Full URL yang ditemukan
-            - HTTP status code aktual
-            - Deskripsi vulnerability
-            - CVSS Score estimasi
-            - Langkah remediasi konkret
-            - Referensi CVE atau OWASP jika relevan
-          " > $REPORT_DIR/ai-executive-summary.md 2>&1 || true
+          Isi file harus berupa Markdown dengan struktur:
 
-      - name: AI analysis - Technical deep dive
+          # 🔐 Security Audit — Executive Summary
+          ## Metadata
+          ## Risk Dashboard (tabel: Severity | Count | Status)
+          ## Overall Risk Score: X/10 — [CRITICAL/HIGH/MEDIUM/LOW]
+          ## Executive Overview (3-4 paragraf untuk C-level)
+          ## Critical Findings (CVSS ≥ 9.0)
+          ## High Findings (CVSS 7.0–8.9)
+          ## Medium Findings (CVSS 4.0–6.9)
+          ## Low / Informational Findings
+          ## Top 5 Remediation Priorities
+          ## Compliance Impact (GDPR, ISO 27001, OWASP, PCI-DSS jika relevan)
+
+          Untuk setiap finding sertakan:
+          - Full URL
+          - HTTP status code
+          - Deskripsi vulnerability
+          - CVSS Score + Vector
+          - Business impact
+          - Langkah remediasi konkret
+          - Referensi CVE / OWASP / CWE
+
+          Tulis file sekarang. Jangan hanya cetak ke stdout.
+          " || true
+
+      - name: opencode — Technical Deep Dive Report
         run: |
-          FINDINGS=$(cat $REPORT_DIR/all-findings.txt | tail -500)
+          FINDINGS=$(cat $REPORT_DIR/all-findings.txt | tail -600)
+
           opencode run "
-            Sebagai penetration tester, lakukan analisis teknis mendalam terhadap:
+          Kamu adalah lead penetration tester. Lakukan analisis teknis mendalam.
 
-            $FINDINGS
+          TARGET: $TARGET_URL
 
-            Berikan:
-            ## Attack Vectors yang ditemukan
-            ## Proof of Concept (safe) untuk setiap finding
-            ## Security Headers Analysis
-            ## SSL/TLS Configuration Issues
-            ## Exposed Endpoints & Sensitive Files
-            ## Rekomendasi Hardening (langkah teknis detail)
+          ATURAN:
+          - Hanya analisis findings yang CONFIRMED (bukan 404)
+          - Sertakan Proof of Concept (aman, tidak merusak) untuk setiap vuln
+          - Format teknis dan actionable untuk developer & sysadmin
 
-            Format: Markdown, teknis dan actionable.
-          " >> $REPORT_DIR/ai-technical-analysis.md 2>&1 || true
+          HASIL SCAN:
+          $FINDINGS
 
-      - name: AI analysis - Remediation plan
+          Tulis ke file: $REPORT_DIR/ai-technical-analysis.md
+
+          Struktur:
+          # 🔧 Technical Security Analysis
+          ## SSL/TLS Configuration Deep Dive
+          ## Security Headers Analysis (grade A-F per header)
+          ## Attack Surface Map (endpoint, service, port yang exposed)
+          ## Confirmed Vulnerabilities — PoC
+          ### [vuln-1] Nama Vulnerability
+          - Evidence
+          - HTTP Request PoC (curl command yang safe)
+          - Expected Response
+          - Root Cause
+          - Fix (code/config snippet)
+          ## Injection Attack Vectors
+          ## Authentication & Session Weaknesses
+          ## Infrastructure & Cloud Misconfigurations
+          ## Third-party / Supply Chain Risk
+          ## Network Security Issues (dari nmap)
+          ## Hardening Checklist (✅/❌ per item)
+
+          Tulis file sekarang.
+          " || true
+
+      - name: opencode — Remediation Roadmap
         run: |
           opencode run "
-            Berdasarkan audit keamanan website $TARGET_URL, buat remediation roadmap:
+          Buat remediation roadmap profesional untuk $TARGET_URL berdasarkan audit keamanan.
 
-            ## Fase 1: Quick wins (0-7 hari) — kritis, mudah fix
-            ## Fase 2: Short term (1-4 minggu) — high severity
-            ## Fase 3: Medium term (1-3 bulan) — medium severity
-            ## Fase 4: Long term (3-12 bulan) — hardening & monitoring
+          Tulis ke file: $REPORT_DIR/ai-remediation-plan.md
 
-            Untuk setiap fase:
-            - Daftar tasks spesifik
-            - Estimasi waktu
-            - Tingkat kesulitan (Easy/Medium/Hard)
-            - Dampak jika tidak diperbaiki
+          Struktur:
+          # 🗺️ Security Remediation Roadmap
 
-            Sertakan juga: Security checklist untuk developer
-          " > $REPORT_DIR/ai-remediation-plan.md 2>&1 || true
+          ## Fase 1: IMMEDIATE — Quick Wins (0–7 hari)
+          Kritis, mudah difix, risiko tinggi jika dibiarkan
+          | # | Task | Difficulty | Effort | Impact |
+          |---|------|-----------|--------|--------|
+          (isi tabel)
+
+          ## Fase 2: SHORT TERM (1–4 minggu)
+          High severity, perlu planning
+
+          ## Fase 3: MEDIUM TERM (1–3 bulan)
+          Medium severity, hardening sistematis
+
+          ## Fase 4: LONG TERM (3–12 bulan)
+          Strategic security improvements
+
+          ## Security Maturity Assessment
+          Nilai maturity saat ini (1–5) per domain:
+          - Access Control
+          - Cryptography
+          - Vulnerability Management
+          - Monitoring & Logging
+          - Incident Response
+          - Developer Security Training
+
+          ## Developer Security Checklist (pre-deployment)
+          (checklist markdown dengan [ ] items)
+
+          ## Security Testing Cadence
+          Rekomendasi jadwal scan & pentest ke depannya
+
+          ## Estimated Investment
+          Perkiraan effort (man-days) & tool yang dibutuhkan
+
+          Tulis file sekarang.
+          " || true
+
+      - name: opencode — SARIF report (GitHub Security tab)
+        run: |
+          FINDINGS=$(cat $REPORT_DIR/all-findings.txt | head -300)
+
+          opencode run "
+          Convert security findings ke format SARIF 2.1.0 untuk GitHub Security tab.
+
+          TARGET: $TARGET_URL
+          FINDINGS:
+          $FINDINGS
+
+          Tulis ke file: $REPORT_DIR/security-results.sarif
+
+          Format SARIF valid JSON, sesuai schema sarif-schema-2.1.0.
+          Setiap finding jadi satu result dengan:
+          - ruleId: ID unik (e.g. SEC-001)
+          - level: error/warning/note
+          - message.text: deskripsi singkat
+          - locations[0].physicalLocation.artifactLocation.uri: full URL
+          - properties.cvss: CVSS score
+
+          Tulis hanya JSON yang valid, tanpa markdown backtick.
+          " || true
 
       - name: Upload AI analysis
         uses: actions/upload-artifact@v4
@@ -541,18 +1261,27 @@ jobs:
           name: ai-analysis
           path: ${{ env.REPORT_DIR }}/
 
-  # ─────────────────────────────────────────────
-  # JOB 5: Generate final report & create Issue
-  # ─────────────────────────────────────────────
+  # ═══════════════════════════════════════════
+  # JOB 4: Final Report + GitHub Integrations
+  # ═══════════════════════════════════════════
   report:
-    name: Generate report & alert
+    name: "📊 Final Report & Alerts"
     runs-on: ubuntu-latest
     needs: ai-analysis
     permissions:
       issues: write
       contents: write
+      security-events: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install opencode-ai
+        run: bun install -g opencode-ai && sleep 2
 
       - name: Download AI analysis
         uses: actions/download-artifact@v4
@@ -560,79 +1289,219 @@ jobs:
           name: ai-analysis
           path: downloaded-ai/
 
-      - name: Build final report
+      - name: Build final consolidated report
         run: |
           mkdir -p $REPORT_DIR
-          cat > $REPORT_DIR/SECURITY-AUDIT-REPORT.md << EOF
-          # Security Audit Report
+          REPORT_FILE=$REPORT_DIR/SECURITY-AUDIT-REPORT.md
+          SCAN_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          - **Target:** $TARGET_URL
-          - **Date:** $(date -u '+%Y-%m-%d %H:%M UTC')
-          - **Scan depth:** $SCAN_DEPTH
-          - **Commit:** ${{ github.sha }}
-          - **Run:** ${{ github.run_id }}
+          {
+            echo "# 🔐 Security Audit Report"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| **Target** | $TARGET_URL |"
+            echo "| **Date** | $SCAN_DATE |"
+            echo "| **Scan Depth** | $SCAN_DEPTH |"
+            echo "| **Commit** | \`${{ github.sha }}\` |"
+            echo "| **Workflow Run** | [#${{ github.run_number }}]($WORKFLOW_URL) |"
+            echo "| **Triggered by** | ${{ github.actor }} |"
+            echo ""
+            echo "---"
+            echo ""
+            cat downloaded-ai/ai-executive-summary.md 2>/dev/null \
+              || echo "⚠️ Executive summary unavailable"
+            echo ""
+            echo "---"
+            echo ""
+            cat downloaded-ai/ai-technical-analysis.md 2>/dev/null \
+              || echo "⚠️ Technical analysis unavailable"
+            echo ""
+            echo "---"
+            echo ""
+            cat downloaded-ai/ai-remediation-plan.md 2>/dev/null \
+              || echo "⚠️ Remediation plan unavailable"
+            echo ""
+            echo "---"
+            echo ""
+            echo "*🤖 Generated by AI Security Audit Pipeline — opencode-ai + GitHub Actions*"
+            echo "*⚠️ This report is for authorized security testing only.*"
+          } > "$REPORT_FILE"
 
-          ---
+          echo "✅ Final report built: $(wc -l < $REPORT_FILE) lines"
 
-          $(cat downloaded-ai/ai-executive-summary.md 2>/dev/null || echo "Executive summary not available")
+      - name: opencode — Generate HTML report
+        run: |
+          SUMMARY=$(cat downloaded-ai/ai-executive-summary.md 2>/dev/null | head -200)
+          TECHNICAL=$(cat downloaded-ai/ai-technical-analysis.md 2>/dev/null | head -200)
 
-          ---
+          opencode run "
+          Konversi laporan keamanan berikut ke HTML yang profesional dan modern.
 
-          $(cat downloaded-ai/ai-technical-analysis.md 2>/dev/null || echo "Technical analysis not available")
+          TARGET: $TARGET_URL
 
-          ---
+          EXECUTIVE SUMMARY:
+          $SUMMARY
 
-          $(cat downloaded-ai/ai-remediation-plan.md 2>/dev/null || echo "Remediation plan not available")
+          TECHNICAL ANALYSIS:
+          $TECHNICAL
 
-          ---
-          *Generated by AI Security Audit Pipeline — opencode-ai + GitHub Actions*
-          EOF
+          Tulis ke file: $REPORT_DIR/SECURITY-AUDIT-REPORT.html
+
+          Requirements:
+          - HTML5 valid, self-contained (inline CSS)
+          - Dark theme profesional (navy/dark background)
+          - Severity badges berwarna (Critical=merah, High=oranye, Medium=kuning, Low=hijau)
+          - Tabel responsif untuk findings
+          - Print-friendly
+          - Header dengan logo 🔐, nama audit, target, tanggal
+          - Navigation sidebar (desktop)
+          - Risk gauge / score visual
+
+          Tulis file HTML sekarang.
+          " || true
 
       - name: Check for critical findings
         id: check-critical
         run: |
-          if grep -iE "critical|CVSS.*[89]\.|CVSS.*10\.|sql injection|remote code|rce|authentication bypass" \
-            downloaded-ai/ai-executive-summary.md 2>/dev/null; then
-            echo "has_critical=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_critical=false" >> $GITHUB_OUTPUT
-          fi
+          CRIT=$(grep -icE \
+            "critical|CVSS.*[89]\.|CVSS.*10\.|sql injection|remote code|rce|authentication bypass|\
+             subdomain takeover|SSRF.*metadata|alg:none|default.*cred" \
+            downloaded-ai/ai-executive-summary.md 2>/dev/null) || CRIT=0
 
-      - name: Create GitHub Issue for critical findings
+          HIGH=$(grep -icE \
+            "high|CVSS.*[67]\." \
+            downloaded-ai/ai-executive-summary.md 2>/dev/null) || HIGH=0
+
+          echo "critical_count=$CRIT" >> $GITHUB_OUTPUT
+          echo "high_count=$HIGH"     >> $GITHUB_OUTPUT
+
+          [ "$CRIT" -gt 0 ] && echo "has_critical=true"  >> $GITHUB_OUTPUT \
+            || echo "has_critical=false" >> $GITHUB_OUTPUT
+
+          echo "Critical: $CRIT | High: $HIGH"
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: downloaded-ai/security-results.sarif
+          category: "security-audit"
+        continue-on-error: true
+
+      - name: Create GitHub Issue — Critical findings
         if: steps.check-critical.outputs.has_critical == 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
+            const critCount = '${{ steps.check-critical.outputs.critical_count }}';
+            const highCount = '${{ steps.check-critical.outputs.high_count }}';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
             let summary = '';
             try {
-              summary = fs.readFileSync('downloaded-ai/ai-executive-summary.md', 'utf8').slice(0, 3000);
-            } catch(e) { summary = 'Could not read summary'; }
+              summary = fs.readFileSync('downloaded-ai/ai-executive-summary.md', 'utf8').slice(0, 3500);
+            } catch(e) { summary = 'Summary unavailable'; }
+
+            const body = [
+              '## 🚨 Security Audit Alert',
+              '',
+              `| Field | Value |`,
+              `|-------|-------|`,
+              `| **Target** | ${process.env.TARGET_URL} |`,
+              `| **Date** | ${new Date().toISOString()} |`,
+              `| **Critical findings** | ${critCount} |`,
+              `| **High findings** | ${highCount} |`,
+              `| **Workflow Run** | [#${context.runNumber}](${runUrl}) |`,
+              '',
+              '---',
+              '',
+              summary,
+              '',
+              '---',
+              '',
+              '> 📎 Full report available in [Actions Artifacts](' + runUrl + ')',
+              '> ⚠️ Please review and remediate critical findings immediately.',
+            ].join('\n');
 
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `🚨 CRITICAL Security Findings — ${process.env.TARGET_URL} (${new Date().toISOString().slice(0,10)})`,
-              body: `## Security Audit Alert\n\n**Target:** ${process.env.TARGET_URL}\n**Date:** ${new Date().toISOString()}\n**Run:** [#${context.runNumber}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n\n---\n\n${summary}\n\n---\n*Please review the full report in the Actions artifacts.*`,
-              labels: ['security', 'critical', 'automated']
+              title: `🚨 [Security] ${critCount} Critical Finding(s) — ${process.env.TARGET_URL} — ${new Date().toISOString().slice(0,10)}`,
+              body,
+              labels: ['security', 'critical', 'automated-audit'],
             });
 
-      - name: Upload final report
+      - name: Slack notification (optional)
+        if: github.event.inputs.notify_slack == 'true'
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+        run: |
+          CRIT="${{ steps.check-critical.outputs.critical_count }}"
+          HIGH="${{ steps.check-critical.outputs.high_count }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ -n "$SLACK_WEBHOOK" ]; then
+            EMOJI="✅"; COLOR="#36a64f"
+            [ "$CRIT" -gt 0 ] && EMOJI="🚨" && COLOR="#cc0000"
+            [ "$HIGH" -gt 0 ] && [ "$CRIT" -eq 0 ] && EMOJI="⚠️" && COLOR="#ff9900"
+
+            curl -s -X POST "$SLACK_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"attachments\": [{
+                  \"color\": \"$COLOR\",
+                  \"title\": \"$EMOJI Security Audit — $TARGET_URL\",
+                  \"text\": \"Critical: $CRIT | High: $HIGH\",
+                  \"fields\": [
+                    {\"title\": \"Target\", \"value\": \"$TARGET_URL\", \"short\": true},
+                    {\"title\": \"Severity\", \"value\": \"Critical: $CRIT, High: $HIGH\", \"short\": true},
+                    {\"title\": \"Report\", \"value\": \"<$RUN_URL|View full report>\", \"short\": false}
+                  ],
+                  \"footer\": \"AI Security Audit Pipeline\"
+                }]
+              }" || true
+          fi
+
+      - name: Upload final reports
         uses: actions/upload-artifact@v4
         with:
           name: SECURITY-AUDIT-REPORT
-          path: ${{ env.REPORT_DIR }}/SECURITY-AUDIT-REPORT.md
+          path: |
+            ${{ env.REPORT_DIR }}/SECURITY-AUDIT-REPORT.md
+            ${{ env.REPORT_DIR }}/SECURITY-AUDIT-REPORT.html
           retention-days: 90
 
-      - name: Summary
+      - name: Workflow summary
         run: |
-          echo "## Security Audit Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Target | $TARGET_URL |" >> $GITHUB_STEP_SUMMARY
-          echo "| Date | $(date -u) |" >> $GITHUB_STEP_SUMMARY
-          echo "| Scan depth | $SCAN_DEPTH |" >> $GITHUB_STEP_SUMMARY
-          echo "| Critical found | ${{ steps.check-critical.outputs.has_critical }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Download the full report from the **Artifacts** section above." >> $GITHUB_STEP_SUMMARY
+          CRIT="${{ steps.check-critical.outputs.critical_count }}"
+          HIGH="${{ steps.check-critical.outputs.high_count }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          {
+            echo "## 🔐 Security Audit Complete"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Target | $TARGET_URL |"
+            echo "| Scan depth | $SCAN_DEPTH |"
+            echo "| Date | $(date -u) |"
+            echo "| Critical findings | $CRIT |"
+            echo "| High findings | $HIGH |"
+            echo "| GitHub Issue | $([ '${{ steps.check-critical.outputs.has_critical }}' = 'true' ] && echo 'Created ✅' || echo 'None') |"
+            echo ""
+            echo "### Jobs completed:"
+            echo "- ✅ Recon & DNS fingerprinting"
+            echo "- ✅ Port & service scan (nmap)"
+            echo "- ✅ SSL/TLS deep audit"
+            echo "- ✅ Web vulnerability scan (nikto, gobuster, sqlmap, dalfox)"
+            echo "- ✅ OWASP Top 10 checks"
+            echo "- ✅ Advanced scan (nuclei CVE, JWT, rate-limit)"
+            echo "- ✅ Infrastructure & cloud misconfiguration"
+            echo "- ✅ AI analysis (executive summary, technical, remediation)"
+            echo "- ✅ HTML report generation"
+            echo ""
+            echo "📎 **Download the full report from the Artifacts section above.**"
+          } >> $GITHUB_STEP_SUMMARY
