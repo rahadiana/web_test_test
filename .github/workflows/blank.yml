@@ -11,14 +11,14 @@ on:
       target_url:
         description: "Target website URL (e.g. https://example.com)"
         required: true
-        default: "https://bekasikota.go.id"
+        default: "https://example.com"
       scan_depth:
         description: "Scan depth: quick | full"
         required: false
         default: "full"
 
 env:
-  TARGET_URL: ${{ github.event.inputs.target_url || 'https://bekasikota.go.id' }}
+  TARGET_URL: ${{ github.event.inputs.target_url || 'https://example.com' }}
   SCAN_DEPTH: ${{ github.event.inputs.scan_depth || 'full' }}
   REPORT_DIR: security-reports
 
@@ -282,13 +282,28 @@ jobs:
             "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" && \
             WORDLIST="/tmp/common.txt"
 
+          # gobuster hanya melaporkan path yang DITEMUKAN (bukan 404)
+          # --no-error agar tidak fail, -b 404 untuk exclude 404 explicitly
           gobuster dir \
             -u "$TARGET_URL" \
             -w "$WORDLIST" \
-            -o $REPORT_DIR/gobuster.txt \
+            -o $REPORT_DIR/gobuster-raw.txt \
             -t 20 \
             --timeout 10s \
+            -b 404 \
             -q 2>&1 || true
+
+          # Konversi path relatif ke full URL
+          if [ -f "$REPORT_DIR/gobuster-raw.txt" ]; then
+            echo "=== Gobuster findings (full URL) ===" > $REPORT_DIR/gobuster.txt
+            while IFS= read -r line; do
+              path=$(echo "$line" | awk "{print \$1}")
+              status=$(echo "$line" | grep -oP "Status: \K[0-9]+")
+              if [ -n "$path" ]; then
+                echo "[HTTP:$status] $TARGET_URL$path"
+              fi
+            done < "$REPORT_DIR/gobuster-raw.txt" >> $REPORT_DIR/gobuster.txt
+          fi
 
       - name: Basic SQLi test
         run: |
@@ -339,16 +354,25 @@ jobs:
             done
 
             echo ""
-            echo "=== Common sensitive files ==="
+            echo "=== Common sensitive files (hanya non-404) ==="
+            FOUND_COUNT=0
             for path in \
               /.env /.git/config /config.php /wp-config.php \
               /admin /administrator /phpmyadmin \
               /.htaccess /backup.zip /database.sql \
               /api/swagger /api/docs /graphql; do
+              FULL_URL="$TARGET_URL$path"
               code=$(curl -s -o /dev/null -w "%{http_code}" \
-                --max-time 5 --connect-timeout 5 "$TARGET_URL$path" 2>/dev/null) || true
-              echo "[${code:-ERR}] $path"
+                --max-time 5 --connect-timeout 5 "$FULL_URL" 2>/dev/null) || true
+              # Hanya laporkan jika bukan 404 dan bukan error
+              if [ "$code" != "404" ] && [ "$code" != "000" ] && [ -n "$code" ]; then
+                echo "[FOUND:$code] $FULL_URL"
+                FOUND_COUNT=$((FOUND_COUNT+1))
+              fi
             done
+            if [ "$FOUND_COUNT" -eq 0 ]; then
+              echo "Tidak ada sensitive file yang ditemukan (semua 404)"
+            fi
           } > $REPORT_DIR/xss-sensitive.txt 2>&1 || true
 
       - name: OWASP Top 10 checks
@@ -358,11 +382,16 @@ jobs:
             URL=$TARGET_URL
 
             echo ""
-            echo "[A01] Broken Access Control"
+            echo "[A01] Broken Access Control (hanya non-404)"
             for path in /admin /dashboard /user/1 /user/2 /api/v1/users /api/v1/admin; do
-              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 --connect-timeout 5 "$URL$path")
-              echo "  [$code] $URL$path"
+              FULL_URL="$URL$path"
+              code=$(curl -s -o /dev/null -w "%{http_code}" \
+                --max-time 5 --connect-timeout 5 "$FULL_URL" 2>/dev/null) || true
+              if [ "$code" != "404" ] && [ "$code" != "000" ] && [ -n "$code" ]; then
+                echo "  [ACCESSIBLE:$code] $FULL_URL"
+              fi
             done
+            echo "  (path yang 404 diabaikan)"
 
             echo ""
             echo "[A02] Cryptographic Failures"
@@ -371,10 +400,14 @@ jobs:
             echo "  HTTP access: $http_code (should be 301/302)"
 
             echo ""
-            echo "[A05] Security Misconfiguration"
+            echo "[A05] Security Misconfiguration (hanya non-404)"
             for file in /phpinfo.php /info.php /test.php /debug.php; do
-              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 --connect-timeout 5 "$URL$file")
-              echo "  [$code] $URL$file"
+              FULL_URL="$URL$file"
+              code=$(curl -s -o /dev/null -w "%{http_code}" \
+                --max-time 5 --connect-timeout 5 "$FULL_URL" 2>/dev/null) || true
+              if [ "$code" != "404" ] && [ "$code" != "000" ] && [ -n "$code" ]; then
+                echo "  [EXPOSED:$code] $FULL_URL"
+              fi
             done
 
             echo ""
@@ -436,12 +469,19 @@ jobs:
             TARGET: $TARGET_URL
             TANGGAL: $(date)
 
+            ATURAN PENTING SEBELUM ANALISIS:
+            - ABAIKAN semua path/URL yang mengembalikan HTTP 404 (Not Found) - itu tidak exist
+            - ABAIKAN semua entry bertanda [404] atau tidak memiliki label [FOUND:] / [ACCESSIBLE:] / [EXPOSED:]
+            - Hanya analisis path/file yang statusnya 200, 301, 302, 403, 500, atau kode lain selain 404
+            - Pastikan setiap temuan menyertakan FULL URL (https://...), bukan hanya path relatif
+            - Jika tidak ada temuan yang valid (semua 404), nyatakan 'Tidak ada finding aktif'
+
             HASIL SCAN:
             $FINDINGS
 
             Berikan analisis dalam format:
             ## Executive Summary
-            ## Critical Findings (CVSS >= 7.0)
+            ## Critical Findings (CVSS >= 7.0) — hanya yang benar-benar accessible
             ## High Findings (CVSS 4.0-6.9)
             ## Medium Findings (CVSS 2.0-3.9)
             ## Low/Info Findings
@@ -449,6 +489,8 @@ jobs:
             ## Risk Score Overall (1-10)
 
             Untuk setiap finding sertakan:
+            - Full URL yang ditemukan
+            - HTTP status code aktual
             - Deskripsi vulnerability
             - CVSS Score estimasi
             - Langkah remediasi konkret
