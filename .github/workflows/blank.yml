@@ -11,14 +11,14 @@ on:
       target_url:
         description: "Target website URL (e.g. https://example.com)"
         required: true
-        default: "https://example.com"
+        default: "https://bekasikota.go.id"
       scan_depth:
         description: "Scan depth: quick | full"
         required: false
         default: "full"
 
 env:
-  TARGET_URL: ${{ github.event.inputs.target_url || 'https://example.com' }}
+  TARGET_URL: ${{ github.event.inputs.target_url || 'https://bekasikota.go.id' }}
   SCAN_DEPTH: ${{ github.event.inputs.scan_depth || 'full' }}
   REPORT_DIR: security-reports
 
