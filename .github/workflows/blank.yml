@@ -1,0 +1,583 @@
+name: AI Website Security Audit
+
+on:
+  push:
+    branches: ["main"]
+  schedule:
+    # Otomatis setiap Senin pukul 01:00 UTC
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "Target website URL (e.g. https://example.com)"
+        required: true
+        default: "https://bekasikota.go.id"
+      scan_depth:
+        description: "Scan depth: quick | full"
+        required: false
+        default: "full"
+
+env:
+  TARGET_URL: ${{ github.event.inputs.target_url || 'https://example.com' }}
+  SCAN_DEPTH: ${{ github.event.inputs.scan_depth || 'full' }}
+  REPORT_DIR: security-reports
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Setup & validasi target
+  # ─────────────────────────────────────────────
+  setup:
+    name: Setup environment
+    runs-on: ubuntu-latest
+    outputs:
+      target_host: ${{ steps.parse.outputs.host }}
+      target_ip: ${{ steps.parse.outputs.ip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install opencode-ai
+        run: |
+          bun install -g opencode-ai
+          opencode --version || opencode --help
+
+      - name: Parse target
+        id: parse
+        run: |
+          HOST=$(echo "$TARGET_URL" | sed 's|https\?://||' | cut -d/ -f1)
+          IP=$(dig +short "$HOST" | head -1)
+          echo "host=$HOST" >> $GITHUB_OUTPUT
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          echo "Target: $HOST ($IP)"
+
+      - name: Install security tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            nmap nikto gobuster testssl.sh \
+            curl wget dnsutils whois \
+            python3-pip jq
+
+          # nuclei untuk template CVE
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/null || true
+          export PATH=$PATH:$(go env GOPATH)/bin
+
+          echo "Tools installed:"
+          nmap --version | head -1
+          nikto -Version 2>/dev/null || true
+          gobuster version 2>/dev/null || true
+
+  # ─────────────────────────────────────────────
+  # JOB 2A: Recon — DNS, WHOIS, headers
+  # ─────────────────────────────────────────────
+  recon:
+    name: Recon & fingerprinting
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -qq dnsutils whois curl jq
+
+      - name: Create report dir
+        run: mkdir -p $REPORT_DIR
+
+      - name: WHOIS lookup
+        run: |
+          whois ${{ needs.setup.outputs.target_host }} > $REPORT_DIR/whois.txt 2>&1 || true
+          echo "=== WHOIS done ==="
+
+      - name: DNS enumeration
+        run: |
+          HOST=${{ needs.setup.outputs.target_host }}
+          {
+            echo "=== A Records ==="
+            dig +short A $HOST
+            echo "=== MX Records ==="
+            dig +short MX $HOST
+            echo "=== TXT Records (SPF/DMARC) ==="
+            dig +short TXT $HOST
+            dig +short TXT _dmarc.$HOST
+            echo "=== NS Records ==="
+            dig +short NS $HOST
+            echo "=== Subdomains (brute) ==="
+            for sub in www api admin mail dev staging test beta app; do
+              result=$(dig +short A $sub.$HOST)
+              if [ -n "$result" ]; then echo "$sub.$HOST -> $result"; fi
+            done
+          } > $REPORT_DIR/dns.txt 2>&1
+
+      - name: HTTP headers & tech fingerprint
+        run: |
+          HOST=${{ needs.setup.outputs.target_host }}
+          URL=$TARGET_URL
+          {
+            echo "=== Response Headers ==="
+            curl -sI --max-time 10 "$URL" 2>&1
+
+            echo ""
+            echo "=== Security headers check ==="
+            for header in \
+              "Strict-Transport-Security" \
+              "Content-Security-Policy" \
+              "X-Frame-Options" \
+              "X-Content-Type-Options" \
+              "Referrer-Policy" \
+              "Permissions-Policy" \
+              "X-XSS-Protection"; do
+              val=$(curl -sI --max-time 10 "$URL" | grep -i "^$header:" || echo "MISSING: $header")
+              echo "$val"
+            done
+
+            echo ""
+            echo "=== Cookies analysis ==="
+            curl -sc /tmp/cookies --max-time 10 "$URL" > /dev/null 2>&1
+            cat /tmp/cookies 2>/dev/null || echo "No cookies"
+
+            echo ""
+            echo "=== Robots.txt ==="
+            curl -s --max-time 10 "$URL/robots.txt" 2>&1
+
+            echo ""
+            echo "=== Sitemap ==="
+            curl -s --max-time 10 "$URL/sitemap.xml" | head -50 2>&1
+
+          } > $REPORT_DIR/headers.txt 2>&1
+
+      - name: Upload recon artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results
+          path: ${{ env.REPORT_DIR }}/
+
+  # ─────────────────────────────────────────────
+  # JOB 2B: Port scan dengan nmap
+  # ─────────────────────────────────────────────
+  port-scan:
+    name: Port & service scan (nmap)
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -qq nmap
+      - run: mkdir -p $REPORT_DIR
+
+      - name: Nmap quick scan (top 1000)
+        run: |
+          IP=${{ needs.setup.outputs.target_ip }}
+          HOST=${{ needs.setup.outputs.target_host }}
+          TARGET=${IP:-$HOST}
+
+          nmap -sV -sC --open \
+            -oN $REPORT_DIR/nmap-quick.txt \
+            -oX $REPORT_DIR/nmap-quick.xml \
+            "$TARGET" 2>&1 || true
+
+      - name: Nmap full scan (if depth=full)
+        if: env.SCAN_DEPTH == 'full'
+        run: |
+          IP=${{ needs.setup.outputs.target_ip }}
+          HOST=${{ needs.setup.outputs.target_host }}
+          TARGET=${IP:-$HOST}
+
+          # Full port range + version + scripts
+          nmap -sV -sC -p- --open \
+            --script "vuln,safe" \
+            -oN $REPORT_DIR/nmap-full.txt \
+            -oX $REPORT_DIR/nmap-full.xml \
+            "$TARGET" 2>&1 || true
+
+      - name: Upload port scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: portscan-results
+          path: ${{ env.REPORT_DIR }}/
+
+  # ─────────────────────────────────────────────
+  # JOB 2C: SSL/TLS audit
+  # ─────────────────────────────────────────────
+  ssl-audit:
+    name: SSL/TLS audit
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -qq testssl.sh
+      - run: mkdir -p $REPORT_DIR
+
+      - name: testssl.sh scan
+        run: |
+          HOST=${{ needs.setup.outputs.target_host }}
+          testssl.sh \
+            --severity LOW \
+            --json-pretty \
+            --logfile $REPORT_DIR/ssl-log.txt \
+            --jsonfile $REPORT_DIR/ssl-result.json \
+            "$HOST" 2>&1 || true
+
+      - name: Manual TLS checks
+        run: |
+          HOST=${{ needs.setup.outputs.target_host }}
+          {
+            echo "=== Certificate info ==="
+            echo | openssl s_client -connect "$HOST:443" -servername "$HOST" 2>/dev/null \
+              | openssl x509 -noout -text 2>/dev/null | grep -E "Subject:|Issuer:|Not After|Not Before|DNS:" | head -20
+
+            echo ""
+            echo "=== Supported protocols ==="
+            for proto in ssl2 ssl3 tls1 tls1_1 tls1_2 tls1_3; do
+              result=$(echo | openssl s_client -connect "$HOST:443" -"$proto" 2>&1 | grep -E "Protocol|CONNECTED|FAILED" | head -1)
+              echo "$proto: $result"
+            done
+
+            echo ""
+            echo "=== HSTS check ==="
+            curl -sI "https://$HOST" | grep -i "strict-transport" || echo "No HSTS header found"
+
+          } > $REPORT_DIR/tls-manual.txt 2>&1
+
+      - name: Upload SSL results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssl-results
+          path: ${{ env.REPORT_DIR }}/
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Web vulnerability scanning
+  # ─────────────────────────────────────────────
+  web-vuln-scan:
+    name: Web vulnerability scan
+    runs-on: ubuntu-latest
+    needs: [recon, port-scan, ssl-audit]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -qq nikto gobuster curl python3 python3-pip wget
+
+      - name: Install wordlists
+        run: |
+          sudo apt-get install -y -qq seclists 2>/dev/null || \
+            git clone --depth=1 https://github.com/danielmiessler/SecLists.git /tmp/SecLists 2>/dev/null || true
+          ls /usr/share/seclists/ 2>/dev/null || ls /tmp/SecLists/ 2>/dev/null || true
+
+      - run: mkdir -p $REPORT_DIR
+
+      - name: Nikto web scan
+        run: |
+          nikto -host "$TARGET_URL" \
+            -output $REPORT_DIR/nikto.txt \
+            -Format txt \
+            -timeout 10 \
+            -Plugins "headers,shellshock,outdated,auth" \
+            2>&1 || true
+
+      - name: Directory enumeration (gobuster)
+        run: |
+          WORDLIST="/usr/share/seclists/Discovery/Web-Content/common.txt"
+          [ ! -f "$WORDLIST" ] && WORDLIST="/tmp/SecLists/Discovery/Web-Content/common.txt"
+          [ ! -f "$WORDLIST" ] && \
+            wget -q -O /tmp/common.txt \
+            "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" && \
+            WORDLIST="/tmp/common.txt"
+
+          gobuster dir \
+            -u "$TARGET_URL" \
+            -w "$WORDLIST" \
+            -o $REPORT_DIR/gobuster.txt \
+            -t 20 \
+            --timeout 10s \
+            -q 2>&1 || true
+
+      - name: Basic SQLi test
+        run: |
+          {
+            echo "=== SQL Injection basic payloads ==="
+            URL=$TARGET_URL
+            for payload in "'" "'OR'1'='1" "'--" "1 OR 1=1" "1; DROP TABLE users--"; do
+              encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$payload'))")
+              result=$(curl -s --max-time 8 "$URL/?id=$encoded" -o /dev/null -w "%{http_code}" 2>&1)
+              echo "Payload: $payload -> HTTP $result"
+            done
+
+            echo ""
+            echo "=== Error-based SQLi on common params ==="
+            for param in id user name search q page; do
+              result=$(curl -s --max-time 8 "$URL/?$param='" 2>&1 | grep -iE "sql|mysql|syntax|ora-|pg_" | head -3)
+              if [ -n "$result" ]; then
+                echo "POTENTIAL SQLi on ?$param: $result"
+              fi
+            done
+          } > $REPORT_DIR/sqli-test.txt 2>&1
+
+      - name: Basic XSS test
+        run: |
+          {
+            echo "=== XSS basic reflection test ==="
+            XSS_PAYLOAD='<script>alert(1)</script>'
+            for param in q search name id; do
+              encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$XSS_PAYLOAD'))")
+              response=$(curl -s --max-time 8 "$TARGET_URL/?$param=$encoded" 2>&1)
+              if echo "$response" | grep -q "$XSS_PAYLOAD"; then
+                echo "REFLECTED XSS found on param: $param"
+              else
+                echo "No reflection on: $param"
+              fi
+            done
+
+            echo ""
+            echo "=== Common sensitive files ==="
+            for path in \
+              /.env /.git/config /config.php /wp-config.php \
+              /admin /administrator /phpmyadmin \
+              /.htaccess /backup.zip /database.sql \
+              /api/swagger /api/docs /graphql; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$TARGET_URL$path")
+              echo "[$code] $path"
+            done
+          } > $REPORT_DIR/xss-sensitive.txt 2>&1
+
+      - name: OWASP Top 10 checks
+        run: |
+          {
+            echo "=== OWASP Top 10 Quick Checks ==="
+            URL=$TARGET_URL
+
+            echo ""
+            echo "[A01] Broken Access Control"
+            for path in /admin /dashboard /user/1 /user/2 /api/v1/users /api/v1/admin; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$URL$path")
+              echo "  [$code] $URL$path"
+            done
+
+            echo ""
+            echo "[A02] Cryptographic Failures"
+            # Cek apakah site bisa diakses via HTTP (redirect check)
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "http://$(echo $URL | sed 's|https\?://||')")
+            echo "  HTTP access: $http_code (should be 301/302)"
+
+            echo ""
+            echo "[A05] Security Misconfiguration"
+            for file in /phpinfo.php /info.php /test.php /debug.php; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$URL$file")
+              echo "  [$code] $URL$file"
+            done
+
+            echo ""
+            echo "[A06] Vulnerable & Outdated Components"
+            curl -sI --max-time 10 "$URL" | grep -iE "Server:|X-Powered-By:|X-AspNet-Version:" || echo "  No version disclosure"
+
+            echo ""
+            echo "[A07] Auth & Session Issues"
+            cookie=$(curl -sc /tmp/auth-cookies --max-time 10 "$URL" > /dev/null 2>&1; cat /tmp/auth-cookies)
+            echo "  Cookies: $cookie" | head -10
+
+          } > $REPORT_DIR/owasp-top10.txt 2>&1
+
+      - name: Upload web scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscan-results
+          path: ${{ env.REPORT_DIR }}/
+
+  # ─────────────────────────────────────────────
+  # JOB 4: AI Analysis dengan opencode
+  # ─────────────────────────────────────────────
+  ai-analysis:
+    name: AI security analysis (opencode)
+    runs-on: ubuntu-latest
+    needs: web-vuln-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install opencode-ai
+        run: |
+          bun install -g opencode-ai
+          sleep 3
+
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-artifacts/
+
+      - name: Merge all reports
+        run: |
+          mkdir -p $REPORT_DIR
+          find downloaded-artifacts/ -name "*.txt" -exec cat {} \; > $REPORT_DIR/all-findings.txt
+          find downloaded-artifacts/ -name "*.json" -exec cat {} \; > $REPORT_DIR/all-findings.json
+          echo "=== MERGED REPORT SIZE ==="
+          wc -l $REPORT_DIR/all-findings.txt
+
+      - name: AI analysis - Executive summary
+        run: |
+          FINDINGS=$(cat $REPORT_DIR/all-findings.txt | head -500)
+          opencode run "
+            Kamu adalah security analyst senior. Analisis hasil scan keamanan berikut:
+
+            TARGET: $TARGET_URL
+            TANGGAL: $(date)
+
+            HASIL SCAN:
+            $FINDINGS
+
+            Berikan analisis dalam format:
+            ## Executive Summary
+            ## Critical Findings (CVSS >= 7.0)
+            ## High Findings (CVSS 4.0-6.9)
+            ## Medium Findings (CVSS 2.0-3.9)
+            ## Low/Info Findings
+            ## Rekomendasi Prioritas (top 5)
+            ## Risk Score Overall (1-10)
+
+            Untuk setiap finding sertakan:
+            - Deskripsi vulnerability
+            - CVSS Score estimasi
+            - Langkah remediasi konkret
+            - Referensi CVE atau OWASP jika relevan
+          " > $REPORT_DIR/ai-executive-summary.md 2>&1 || true
+
+      - name: AI analysis - Technical deep dive
+        run: |
+          FINDINGS=$(cat $REPORT_DIR/all-findings.txt | tail -500)
+          opencode run "
+            Sebagai penetration tester, lakukan analisis teknis mendalam terhadap:
+
+            $FINDINGS
+
+            Berikan:
+            ## Attack Vectors yang ditemukan
+            ## Proof of Concept (safe) untuk setiap finding
+            ## Security Headers Analysis
+            ## SSL/TLS Configuration Issues
+            ## Exposed Endpoints & Sensitive Files
+            ## Rekomendasi Hardening (langkah teknis detail)
+
+            Format: Markdown, teknis dan actionable.
+          " >> $REPORT_DIR/ai-technical-analysis.md 2>&1 || true
+
+      - name: AI analysis - Remediation plan
+        run: |
+          opencode run "
+            Berdasarkan audit keamanan website $TARGET_URL, buat remediation roadmap:
+
+            ## Fase 1: Quick wins (0-7 hari) — kritis, mudah fix
+            ## Fase 2: Short term (1-4 minggu) — high severity
+            ## Fase 3: Medium term (1-3 bulan) — medium severity
+            ## Fase 4: Long term (3-12 bulan) — hardening & monitoring
+
+            Untuk setiap fase:
+            - Daftar tasks spesifik
+            - Estimasi waktu
+            - Tingkat kesulitan (Easy/Medium/Hard)
+            - Dampak jika tidak diperbaiki
+
+            Sertakan juga: Security checklist untuk developer
+          " > $REPORT_DIR/ai-remediation-plan.md 2>&1 || true
+
+      - name: Upload AI analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-analysis
+          path: ${{ env.REPORT_DIR }}/
+
+  # ─────────────────────────────────────────────
+  # JOB 5: Generate final report & create Issue
+  # ─────────────────────────────────────────────
+  report:
+    name: Generate report & alert
+    runs-on: ubuntu-latest
+    needs: ai-analysis
+    permissions:
+      issues: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download AI analysis
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-analysis
+          path: downloaded-ai/
+
+      - name: Build final report
+        run: |
+          mkdir -p $REPORT_DIR
+          cat > $REPORT_DIR/SECURITY-AUDIT-REPORT.md << EOF
+          # Security Audit Report
+
+          - **Target:** $TARGET_URL
+          - **Date:** $(date -u '+%Y-%m-%d %H:%M UTC')
+          - **Scan depth:** $SCAN_DEPTH
+          - **Commit:** ${{ github.sha }}
+          - **Run:** ${{ github.run_id }}
+
+          ---
+
+          $(cat downloaded-ai/ai-executive-summary.md 2>/dev/null || echo "Executive summary not available")
+
+          ---
+
+          $(cat downloaded-ai/ai-technical-analysis.md 2>/dev/null || echo "Technical analysis not available")
+
+          ---
+
+          $(cat downloaded-ai/ai-remediation-plan.md 2>/dev/null || echo "Remediation plan not available")
+
+          ---
+          *Generated by AI Security Audit Pipeline — opencode-ai + GitHub Actions*
+          EOF
+
+      - name: Check for critical findings
+        id: check-critical
+        run: |
+          if grep -iE "critical|CVSS.*[89]\.|CVSS.*10\.|sql injection|remote code|rce|authentication bypass" \
+            downloaded-ai/ai-executive-summary.md 2>/dev/null; then
+            echo "has_critical=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_critical=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Issue for critical findings
+        if: steps.check-critical.outputs.has_critical == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = '';
+            try {
+              summary = fs.readFileSync('downloaded-ai/ai-executive-summary.md', 'utf8').slice(0, 3000);
+            } catch(e) { summary = 'Could not read summary'; }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 CRITICAL Security Findings — ${process.env.TARGET_URL} (${new Date().toISOString().slice(0,10)})`,
+              body: `## Security Audit Alert\n\n**Target:** ${process.env.TARGET_URL}\n**Date:** ${new Date().toISOString()}\n**Run:** [#${context.runNumber}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n\n---\n\n${summary}\n\n---\n*Please review the full report in the Actions artifacts.*`,
+              labels: ['security', 'critical', 'automated']
+            });
+
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: SECURITY-AUDIT-REPORT
+          path: ${{ env.REPORT_DIR }}/SECURITY-AUDIT-REPORT.md
+          retention-days: 90
+
+      - name: Summary
+        run: |
+          echo "## Security Audit Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | $TARGET_URL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Date | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan depth | $SCAN_DEPTH |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical found | ${{ steps.check-critical.outputs.has_critical }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download the full report from the **Artifacts** section above." >> $GITHUB_STEP_SUMMARY
