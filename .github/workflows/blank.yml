@@ -11,7 +11,7 @@ on:
       target_url:
         description: "Target website URL (e.g. https://example.com)"
         required: true
-        default: "https://bekasikota.go.id"
+        default: "https://disparbud.bekasikota.go.id"
       scan_depth:
         description: "Scan depth: quick | full | aggressive"
         required: false
@@ -26,7 +26,7 @@ on:
         default: "false"
 
 env:
-  TARGET_URL: ${{ github.event.inputs.target_url || 'https://bekasikota.go.id' }}
+  TARGET_URL: ${{ github.event.inputs.target_url || 'https://disparbud.bekasikota.go.id' }}
   SCAN_DEPTH: ${{ github.event.inputs.scan_depth || 'full' }}
   AUTH_TOKEN: ${{ github.event.inputs.auth_token || '' }}
   REPORT_DIR: security-reports
