@@ -497,34 +497,44 @@ jobs:
 
       - name: Directory & file enumeration (gobuster)
         run: |
-          # ── 1. Buat micro-wordlist di memory (tidak download besar) ───
-          cat > /tmp/micro.txt << 'EOF'
-          admin,login,dashboard,api,api/v1,api/v2,backup,config,uploads,static
-          images,js,css,assets,media,files,docs,documentation,swagger,swagger.json
-          openapi.json,api-docs,graphql,health,status,ping,.env,.git,robots.txt
-          sitemap.xml,web.config,.htaccess,phpinfo.php,info.php,server-status
-          wp-admin,wp-login.php,wp-config.php,administrator,phpmyadmin,adminer
-          console,actuator,actuator/health,actuator/env,metrics,debug,trace
-          tmp,temp,test,old,bak,src,app,includes,lib,vendor,node_modules,cache
-          database,db,sql,dump,export,install,setup,update,upgrade,cron,jobs
-          private,secret,internal,staging,dev,beta,v1,v2,v3,data,logs,log
-          EOF
-          # Ganti koma jadi newline
-          tr , '\n' < /tmp/micro.txt > /tmp/wordlist-mini.txt
+          # Bug #1 fix: pakai printf, bukan heredoc (hindari leading spaces dari indentasi YAML)
+          printf '%s\n' \
+            admin login dashboard api api/v1 api/v2 backup config \
+            uploads static images js css assets media files docs \
+            swagger swagger.json openapi.json api-docs graphql \
+            health status ping .env .git robots.txt sitemap.xml \
+            web.config .htaccess phpinfo.php info.php server-status \
+            wp-admin wp-login.php wp-config.php administrator \
+            phpmyadmin adminer console actuator metrics debug tmp \
+            temp test old bak vendor node_modules cache database \
+            db sql dump export install setup private secret staging \
+            dev beta v1 v2 v3 logs log data \
+            > /tmp/wordlist-mini.txt
           echo "Mini wordlist: $(wc -l < /tmp/wordlist-mini.txt) kata"
 
-          # ── 2. Pakai SecLists kalau ada, fallback ke mini ─────────────
+          # Bug #3 fix: batasi max 5000 kata untuk Tier 1 (per-push scan)
           WORDLIST="/tmp/wordlist-mini.txt"
+          MAX_WORDS=5000
           for wl in \
             "/usr/share/seclists/Discovery/Web-Content/raft-small-words.txt" \
             "/usr/share/seclists/Discovery/Web-Content/common.txt" \
             "/tmp/SecLists/Discovery/Web-Content/raft-small-words.txt"; do
-            [ -f "$wl" ] && WORDLIST="$wl" && break
+            if [ -f "$wl" ]; then
+              COUNT=$(wc -l < "$wl")
+              if [ "$COUNT" -le "$MAX_WORDS" ]; then
+                WORDLIST="$wl"
+                break
+              else
+                head -n "$MAX_WORDS" "$wl" > /tmp/wordlist-trimmed.txt
+                WORDLIST="/tmp/wordlist-trimmed.txt"
+                break
+              fi
+            fi
           done
           echo "Using wordlist: $WORDLIST ($(wc -l < "$WORDLIST") entries)"
 
-          # ── 3. Single gobuster run, thread tinggi, timeout ketat ──────
-          timeout 180 gobuster dir \
+          # Bug #2 fix: gobuster DAN curl dijalankan paralel (keduanya di background)
+          timeout 150 gobuster dir \
             -u "$TARGET_URL" \
             -w "$WORDLIST" \
             -t 50 \
@@ -533,10 +543,9 @@ jobs:
             -x php,html,js,json,txt,bak \
             --no-error -q \
             -o "$REPORT_DIR/gobuster-dirs.txt" \
-            2>&1 || true
+            2>/dev/null &
+          GOBUSTER_PID=$!
 
-          # ── 4. Langsung curl untuk file sensitif kritis (lebih cepat) ─
-          # Ini menggantikan "run kedua gobuster"
           {
             echo "=== Critical path direct check ==="
             for path in \
@@ -553,16 +562,19 @@ jobs:
               [ "$CODE" = "200" ] && \
                 echo "  [EXPOSED:$CODE] $TARGET_URL$path"
             done
-          } &                                       # ← paralel dengan gobuster!
+          } > "$REPORT_DIR/critical-paths.txt" &
           CURL_PID=$!
 
-          # Tunggu keduanya selesai
-          wait "$CURL_PID"
+          # Tunggu keduanya selesai (beneran paralel)
+          wait "$GOBUSTER_PID" "$CURL_PID"
 
-          # ── 5. Rangkum hasil ──────────────────────────────────────────
+          # Rangkum hasil
           {
-            echo "=== Gobuster findings (dirs + files) ==="
+            echo "=== Gobuster findings ==="
             awk '{print $1, $2}' "$REPORT_DIR/gobuster-dirs.txt" 2>/dev/null || true
+            echo ""
+            echo "=== Critical path findings ==="
+            cat "$REPORT_DIR/critical-paths.txt" 2>/dev/null || true
           } > "$REPORT_DIR/gobuster-summary.txt" || true
 
       - name: Sensitive file exposure check
