@@ -533,7 +533,7 @@ jobs:
           done
           echo "Using wordlist: $WORDLIST ($(wc -l < "$WORDLIST") entries)"
 
-          # Bug #2 fix: gobuster DAN curl dijalankan paralel (keduanya di background)
+           # Bug #2 fix: gobuster DAN curl dijalankan paralel (keduanya di background)# ── gobuster di background ──
           timeout 150 gobuster dir \
             -u "$TARGET_URL" \
             -w "$WORDLIST" \
@@ -545,7 +545,8 @@ jobs:
             -o "$REPORT_DIR/gobuster-dirs.txt" \
             2>/dev/null &
           GOBUSTER_PID=$!
-
+          
+          # ── curl paralel di background ──
           {
             echo "=== Critical path direct check ==="
             for path in \
@@ -564,18 +565,10 @@ jobs:
             done
           } > "$REPORT_DIR/critical-paths.txt" &
           CURL_PID=$!
-
-          # Tunggu keduanya selesai (beneran paralel)
-          wait "$GOBUSTER_PID" "$CURL_PID"
-
-          # Rangkum hasil
-          {
-            echo "=== Gobuster findings ==="
-            awk '{print $1, $2}' "$REPORT_DIR/gobuster-dirs.txt" 2>/dev/null || true
-            echo ""
-            echo "=== Critical path findings ==="
-            cat "$REPORT_DIR/critical-paths.txt" 2>/dev/null || true
-          } > "$REPORT_DIR/gobuster-summary.txt" || true
+          
+          # ── tunggu keduanya, || true supaya exit code tidak propagate ──
+          wait "$GOBUSTER_PID" || true
+          wait "$CURL_PID"     || true
 
       - name: Sensitive file exposure check
         run: |
