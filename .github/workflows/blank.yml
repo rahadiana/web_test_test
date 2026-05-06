@@ -524,15 +524,15 @@ jobs:
           echo "Using wordlist: $WORDLIST ($(wc -l < "$WORDLIST") entries)"
 
           # ── 3. Single gobuster run, thread tinggi, timeout ketat ──────
-          timeout 150 gobuster dir \                 # hard kill 2.5 menit
+          timeout 180 gobuster dir \
             -u "$TARGET_URL" \
             -w "$WORDLIST" \
-            -o "$REPORT_DIR/gobuster-dirs.txt" \
-            -t 50 \                                  # 2× thread (25→50)
-            --timeout 3s \                         # 3× lebih cepat (10s→3s)
-            -b 404,429,503 \                      # skip rate-limit responses
-            -x php,html,js,json,txt,bak \          # kurangi 10→6 ext yang paling relevan
+            -t 50 \
+            --timeout 3s \
+            -b 404,429,503 \
+            -x php,html,js,json,txt,bak \
             --no-error -q \
+            -o "$REPORT_DIR/gobuster-dirs.txt" \
             2>&1 || true
 
           # ── 4. Langsung curl untuk file sensitif kritis (lebih cepat) ─
