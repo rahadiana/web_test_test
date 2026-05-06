@@ -497,33 +497,72 @@ jobs:
 
       - name: Directory & file enumeration (gobuster)
         run: |
-          WORDLIST="/usr/share/seclists/Discovery/Web-Content/common.txt"
-          [ ! -f "$WORDLIST" ] && WORDLIST="/tmp/SecLists/Discovery/Web-Content/common.txt"
-          if [ ! -f "$WORDLIST" ]; then
-            wget -q -O /tmp/common.txt \
-              "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt"
-            WORDLIST="/tmp/common.txt"
-          fi
+          # ── 1. Buat micro-wordlist di memory (tidak download besar) ───
+          cat > /tmp/micro.txt << 'EOF'
+          admin,login,dashboard,api,api/v1,api/v2,backup,config,uploads,static
+          images,js,css,assets,media,files,docs,documentation,swagger,swagger.json
+          openapi.json,api-docs,graphql,health,status,ping,.env,.git,robots.txt
+          sitemap.xml,web.config,.htaccess,phpinfo.php,info.php,server-status
+          wp-admin,wp-login.php,wp-config.php,administrator,phpmyadmin,adminer
+          console,actuator,actuator/health,actuator/env,metrics,debug,trace
+          tmp,temp,test,old,bak,src,app,includes,lib,vendor,node_modules,cache
+          database,db,sql,dump,export,install,setup,update,upgrade,cron,jobs
+          private,secret,internal,staging,dev,beta,v1,v2,v3,data,logs,log
+          EOF
+          # Ganti koma jadi newline
+          tr , '\n' < /tmp/micro.txt > /tmp/wordlist-mini.txt
+          echo "Mini wordlist: $(wc -l < /tmp/wordlist-mini.txt) kata"
 
-          gobuster dir \
-            -u "$TARGET_URL" -w "$WORDLIST" \
+          # ── 2. Pakai SecLists kalau ada, fallback ke mini ─────────────
+          WORDLIST="/tmp/wordlist-mini.txt"
+          for wl in \
+            "/usr/share/seclists/Discovery/Web-Content/raft-small-words.txt" \
+            "/usr/share/seclists/Discovery/Web-Content/common.txt" \
+            "/tmp/SecLists/Discovery/Web-Content/raft-small-words.txt"; do
+            [ -f "$wl" ] && WORDLIST="$wl" && break
+          done
+          echo "Using wordlist: $WORDLIST ($(wc -l < "$WORDLIST") entries)"
+
+          # ── 3. Single gobuster run, thread tinggi, timeout ketat ──────
+          timeout 150 gobuster dir \                 # hard kill 2.5 menit
+            -u "$TARGET_URL" \
+            -w "$WORDLIST" \
             -o "$REPORT_DIR/gobuster-dirs.txt" \
-            -t 25 --timeout 10s -b 404 -q \
-            -x php,html,js,json,txt,bak,old,backup,zip,sql \
+            -t 50 \                                  # 2× thread (25→50)
+            --timeout 3s \                         # 3× lebih cepat (10s→3s)
+            -b 404,429,503 \                      # skip rate-limit responses
+            -x php,html,js,json,txt,bak \          # kurangi 10→6 ext yang paling relevan
+            --no-error -q \
             2>&1 || true
 
-          gobuster dir \
-            -u "$TARGET_URL" -w "$WORDLIST" \
-            -o "$REPORT_DIR/gobuster-files.txt" \
-            -t 25 --timeout 10s -b 404 -q \
-            2>&1 || true
-
+          # ── 4. Langsung curl untuk file sensitif kritis (lebih cepat) ─
+          # Ini menggantikan "run kedua gobuster"
           {
-            echo "=== Directory findings ==="
+            echo "=== Critical path direct check ==="
+            for path in \
+              /.env /.env.local /.env.production /.git/config \
+              /config.php /configuration.php /settings.py \
+              /wp-config.php /wp-config.php.bak /database.sql \
+              /dump.sql /backup.zip /backup.tar.gz /site.sql \
+              /phpinfo.php /info.php /.htpasswd /web.config \
+              /actuator/env /actuator/health /api/swagger.json \
+              /openapi.json /.DS_Store /Thumbs.db; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                --max-time 3 --connect-timeout 2 \
+                "$TARGET_URL$path" 2>/dev/null) || CODE=0
+              [ "$CODE" = "200" ] && \
+                echo "  [EXPOSED:$CODE] $TARGET_URL$path"
+            done
+          } &                                       # ← paralel dengan gobuster!
+          CURL_PID=$!
+
+          # Tunggu keduanya selesai
+          wait "$CURL_PID"
+
+          # ── 5. Rangkum hasil ──────────────────────────────────────────
+          {
+            echo "=== Gobuster findings (dirs + files) ==="
             awk '{print $1, $2}' "$REPORT_DIR/gobuster-dirs.txt" 2>/dev/null || true
-            echo ""
-            echo "=== File findings ==="
-            awk '{print $1, $2}' "$REPORT_DIR/gobuster-files.txt" 2>/dev/null || true
           } > "$REPORT_DIR/gobuster-summary.txt" || true
 
       - name: Sensitive file exposure check
@@ -614,45 +653,57 @@ jobs:
             done
           } > "$REPORT_DIR/sqli.txt" || true
 
-      - name: XSS scan
+
+      - name: XSS Scan
         run: |
-          export PATH="$GOPATH/bin:$PATH"
-          {
-            echo "=== XSS scan with dalfox ==="
-            if command -v dalfox &>/dev/null; then
-              dalfox url "$TARGET_URL" \
-                --silence --no-color \
-                --timeout 10 --delay 200 \
-                -o "$REPORT_DIR/dalfox-raw.txt" 2>/dev/null || true
-              cat "$REPORT_DIR/dalfox-raw.txt" 2>/dev/null || echo "No dalfox findings"
-            else
-              echo "dalfox unavailable"
-            fi
-
-            echo ""
-            echo "=== Reflected XSS (manual) ==="
-            XSS_PAYLOADS=(
-              '<script>alert(1)</script>'
-              '"><script>alert(1)</script>'
-              '<img src=x onerror=alert(1)>'
-              '<svg/onload=alert(1)>'
-            )
-            for param in q search name id term keyword; do
-              for payload in "${XSS_PAYLOADS[@]}"; do
-                response=$(curl -s --max-time 8 --connect-timeout 5 \
-                  --get --data-urlencode "$param=$payload" "$TARGET_URL" 2>/dev/null) || continue
-                echo "$response" | grep -qF "$payload" && \
-                  echo "[REFLECTED XSS] param=$param payload=$payload" || true
-              done
-            done
-
-            echo ""
-            echo "=== DOM XSS hints ==="
-            HTML=$(curl -s --max-time 10 "$TARGET_URL" 2>/dev/null)
-            echo "$HTML" | grep -iE "document\.write|innerHTML|eval\(|location\.hash|location\.search" \
-              | head -10 | sed 's/^/  [DOM-HINT] /' || echo "  No obvious DOM XSS sinks"
-          } > "$REPORT_DIR/xss.txt" || true
-
+              export PATH="$GOPATH/bin:$PATH"
+              {
+                echo "=== XSS scan with dalfox ==="
+                if command -v dalfox &>/dev/null; then
+                  timeout 180 dalfox url "$TARGET_URL" \  # ← hard limit 3 menit total
+                    --silence --no-color \
+                    --timeout 5 \                          # ← turunkan per-request timeout
+                    --delay 100 \                          # ← kurangi delay
+                    --max-crawl 30 \                      # ← batasi jumlah URL yang di-crawl
+                    --worker 5 \                          # ← paralel 5 worker
+                    -o "$REPORT_DIR/dalfox-raw.txt" 2>/dev/null || true
+                  cat "$REPORT_DIR/dalfox-raw.txt" 2>/dev/null || echo "No findings"
+                else
+                  echo "dalfox unavailable"
+                fi
+          
+                echo "=== Reflected XSS (parallel) ==="
+                # Kirim semua request PARALEL sekaligus, tunggu semua selesai
+                XSS_PAYLOADS=(
+                  '<script>alert(1)</script>'
+                  '"><img src=x onerror=alert(1)>'    # ← gabung 4→2 payload esensial
+                  '<svg/onload=alert(1)>'
+                )
+                PIDS=()
+                for param in q search name id; do           # ← kurangi 6→4 param paling umum
+                  for payload in "${XSS_PAYLOADS[@]}"; do
+                    (
+                      resp=$(curl -s --max-time 4 \        # ← 4s cukup, turunkan dari 8s
+                        --connect-timeout 3 \
+                        --get --data-urlencode "$param=$payload" \
+                        "$TARGET_URL" 2>/dev/null) || exit 0
+                      echo "$resp" | grep -qF "$payload" && \
+                        echo "[REFLECTED XSS] param=$param"
+                    ) &                                    # ← jalankan di background
+                    PIDS+=($!)
+                  done
+                done
+                wait "${PIDS[@]}"                         # ← tunggu semua paralel selesai
+          
+                echo "=== DOM XSS hints ==="
+                curl -s --max-time 8 --connect-timeout 5 \
+                  "$TARGET_URL" 2>/dev/null \
+                  | grep -iE "document\.write|innerHTML|eval\(|location\.hash" \
+                  | head -10 | sed 's/^/  [DOM-HINT] /' \
+                  || echo "  No obvious DOM XSS sinks"
+          
+              } > "$REPORT_DIR/xss.txt" || true
+          
       - name: OWASP Top 10 checks
         run: |
           URL="$TARGET_URL"
